@@ -14,6 +14,7 @@ import dev.rosewood.rosestacker.listener.BlockListener;
 import dev.rosewood.rosestacker.listener.BreedingListener;
 import dev.rosewood.rosestacker.listener.EntitiesLoadListener;
 import dev.rosewood.rosestacker.listener.EntityListener;
+import dev.rosewood.rosestacker.listener.FoliaListener;
 import dev.rosewood.rosestacker.listener.InteractListener;
 import dev.rosewood.rosestacker.listener.ItemListener;
 import dev.rosewood.rosestacker.listener.SkyblockHookListener;
@@ -25,9 +26,11 @@ import dev.rosewood.rosestacker.manager.CommandManager;
 import dev.rosewood.rosestacker.manager.EntityCacheManager;
 import dev.rosewood.rosestacker.manager.HologramManager;
 import dev.rosewood.rosestacker.manager.LocaleManager;
+import dev.rosewood.rosestacker.manager.PlayerCacheManager;
 import dev.rosewood.rosestacker.manager.StackManager;
 import dev.rosewood.rosestacker.manager.StackSettingManager;
 import dev.rosewood.rosestacker.nms.NMSAdapter;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import dev.rosewood.rosestacker.utils.StackerUtils;
 import dev.rosewood.rosestacker.utils.ThreadUtils;
 import java.util.List;
@@ -113,6 +116,22 @@ public class RoseStacker extends RosePlugin {
         // Try to hook with WildChests
         if (Bukkit.getPluginManager().isPluginEnabled("WildChests"))
             WildChestsStackerProvider.register();
+
+        // Folia: listen for the point where region threads start ticking in parallel so startup-time
+        // world scans can be distinguished from runtime reloads, and backfill chunk maintenance tasks
+        // for chunks that were loaded before this plugin was listening
+        try {
+            Class.forName("io.papermc.paper.threadedregions.RegionizedServerInitEvent");
+            pluginManager.registerEvents(new FoliaListener(this), this);
+
+            if (FoliaCompat.isFolia()) {
+                StackManager stackManager = this.getManager(StackManager.class);
+                if (stackManager != null)
+                    stackManager.backfillChunkMaintenance();
+            }
+        } catch (ClassNotFoundException e) {
+            // Not running a server with Folia API classes, nothing to do
+        }
     }
 
     @Override
@@ -133,6 +152,7 @@ public class RoseStacker extends RosePlugin {
                 StackSettingManager.class,
                 CommandManager.class,
                 EntityCacheManager.class,
+                PlayerCacheManager.class,
                 StackManager.class
         );
     }

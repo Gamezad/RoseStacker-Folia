@@ -15,3 +15,6 @@ RoseStacker is compatible with Spigot and any forks. We recommend using [Paper](
 We support Minecraft versions **1.16.5** and newer running **Java 17**.
 
 If you wish to use this plugin on a 1.16.5 server (newer versions do not need this), you will need to use [Paper](https://papermc.io/) (or a fork of Paper), Java 17, and add the flag `-DPaper.IgnoreJavaVersion=true` to your server's startup parameters.
+
+#### Folia
+This fork also supports [Folia](https://papermc.io/folia). Folia-aware scheduling is used throughout (RegionScheduler / EntityScheduler / GlobalRegionScheduler via the RoseGarden scheduler layer), region ownership is checked before any cross-region state access, and per-chunk region-local maintenance replaces the world-wide entity rescans. On Folia, spawner spawning runs on the region that owns the spawner (vanilla already ticks spawners there), so the `spawn-async` spawner setting has no effect — its async offloading happens only on Paper/Spigot.

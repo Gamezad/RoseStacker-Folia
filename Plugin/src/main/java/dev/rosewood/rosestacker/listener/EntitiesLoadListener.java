@@ -2,6 +2,7 @@ package dev.rosewood.rosestacker.listener;
 
 import dev.rosewood.rosegarden.RosePlugin;
 import dev.rosewood.rosestacker.manager.StackManager;
+import dev.rosewood.rosestacker.stack.StackingThread;
 import dev.rosewood.rosestacker.utils.PersistentDataUtils;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.LivingEntity;
@@ -24,11 +25,17 @@ public class EntitiesLoadListener implements Listener {
         if (stackManager.isWorldDisabled(event.getWorld()))
             return;
 
+        StackingThread stackingThread = stackManager.getStackingThread(event.getWorld());
+
+        // Folia: start the region-local maintenance task (entity cache refresh + orphan rescan) for this chunk
+        if (stackingThread != null)
+            stackingThread.onChunkLoaded(event.getChunk());
+
         for (Entity entity : event.getEntities())
             if (entity instanceof LivingEntity livingEntity && !stackManager.isAreaDisabled(livingEntity.getLocation()))
                 PersistentDataUtils.applyDisabledAi(livingEntity);
 
-        this.rosePlugin.getManager(StackManager.class).loadChunkEntities(event.getEntities());
+        stackManager.loadChunkEntities(event.getEntities());
     }
 
     @EventHandler
@@ -37,7 +44,11 @@ public class EntitiesLoadListener implements Listener {
         if (stackManager.isWorldDisabled(event.getWorld()))
             return;
 
-        this.rosePlugin.getManager(StackManager.class).saveChunkEntities(event.getEntities(), true);
+        StackingThread stackingThread = stackManager.getStackingThread(event.getWorld());
+        if (stackingThread != null)
+            stackingThread.onChunkUnloaded(event.getChunk());
+
+        stackManager.saveChunkEntities(event.getEntities(), true);
     }
 
 }

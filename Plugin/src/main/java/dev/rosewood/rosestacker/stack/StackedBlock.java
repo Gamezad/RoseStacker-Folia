@@ -9,6 +9,7 @@ import dev.rosewood.rosestacker.manager.HologramManager;
 import dev.rosewood.rosestacker.manager.LocaleManager;
 import dev.rosewood.rosestacker.manager.StackSettingManager;
 import dev.rosewood.rosestacker.stack.settings.BlockStackSettings;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import dev.rosewood.rosestacker.utils.StackerUtils;
 import dev.rosewood.rosestacker.utils.ThreadUtils;
 import java.util.List;
@@ -96,6 +97,13 @@ public class StackedBlock extends Stack<BlockStackSettings> {
     public void updateDisplay() {
         if (!SettingKey.BLOCK_DISPLAY_TAGS.get() || this.stackSettings == null)
             return;
+
+        if (!FoliaCompat.canUseBlock(this.block)) {
+            // Folia: block state and the hologram armor stand live in the block's region
+            if (this.block != null)
+                ThreadUtils.runSync(this.block.getLocation(), this::updateDisplay);
+            return;
+        }
 
         HologramManager hologramManager = RoseStacker.getInstance().getManager(HologramManager.class);
 

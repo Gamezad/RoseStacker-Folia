@@ -7,6 +7,7 @@ import dev.rosewood.rosestacker.config.SettingKey;
 import dev.rosewood.rosestacker.nms.NMSAdapter;
 import dev.rosewood.rosestacker.nms.NMSHandler;
 import dev.rosewood.rosestacker.nms.hologram.Hologram;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import dev.rosewood.rosestacker.utils.ThreadUtils;
 import java.util.Collection;
 import java.util.List;
@@ -58,6 +59,20 @@ public class HologramManager extends Manager implements Listener {
     }
 
     private void updateWatchers() {
+        if (FoliaCompat.isFolia()) {
+            // Holograms are pure packet displays (no world state), only the range/LOS checks need care:
+            // player positions come from region-safe snapshots and raycasts fall back gracefully
+            PlayerCacheManager playerCacheManager = this.rosePlugin.getManager(PlayerCacheManager.class);
+            if (playerCacheManager == null)
+                return;
+
+            for (Hologram hologram : this.holograms.values())
+                for (PlayerCacheManager.PlayerSnapshot snapshot : playerCacheManager.getSnapshots())
+                    this.updateWatcher(snapshot, hologram);
+
+            return;
+        }
+
         Collection<? extends Player> players = Bukkit.getOnlinePlayers();
         for (Player player : players)
             for (Hologram hologram : this.holograms.values())
@@ -74,12 +89,60 @@ public class HologramManager extends Manager implements Listener {
         }
     }
 
+    /**
+     * Folia variant of {@link #updateWatcher(Player, Hologram)} using a region-safe player snapshot
+     */
+    private void updateWatcher(PlayerCacheManager.PlayerSnapshot snapshot, Hologram hologram) {
+        if (!snapshot.isValid())
+            return;
+
+        Location hologramLocation = hologram.getLocation();
+        if (hologramLocation.getWorld() == null || !hologramLocation.getWorld().getName().equals(snapshot.getWorldName()))
+            return;
+
+        double dx = snapshot.getX() - hologramLocation.getX();
+        double dy = snapshot.getY() - hologramLocation.getY();
+        double dz = snapshot.getZ() - hologramLocation.getZ();
+        boolean inRange = dx * dx + dy * dy + dz * dz <= this.renderDistanceSqrd;
+
+        Player player = Bukkit.getPlayer(snapshot.getPlayerId());
+        if (player == null)
+            return;
+
+        if (inRange) {
+            hologram.addWatcher(player);
+            if (this.hideThroughWalls) {
+                try {
+                    hologram.setVisibility(player, this.nmsHandler.hasLineOfSight(player, hologram.getDisplayLocation()));
+                } catch (Throwable e) {
+                    // The raycast crossed a region boundary; keep the current visibility state
+                }
+            }
+        } else {
+            hologram.removeWatcher(player);
+        }
+    }
+
     private boolean isPlayerInRange(Player player, Location location) {
         return player.getWorld().equals(location.getWorld()) && player.getLocation().distanceSquared(location) <= this.renderDistanceSqrd;
     }
 
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
+        if (FoliaCompat.isFolia()) {
+            // Give PlayerCacheManager a moment to prime the player's snapshot, then run the snapshot pass
+            ThreadUtils.runAsyncDelayed(() -> {
+                PlayerCacheManager playerCacheManager = this.rosePlugin.getManager(PlayerCacheManager.class);
+                PlayerCacheManager.PlayerSnapshot snapshot = playerCacheManager != null ? playerCacheManager.getSnapshot(event.getPlayer().getUniqueId()) : null;
+                if (snapshot == null || !snapshot.isValid())
+                    return;
+
+                for (Hologram hologram : this.holograms.values())
+                    this.updateWatcher(snapshot, hologram);
+            }, 2L);
+            return;
+        }
+
         ThreadUtils.runAsync(() -> {
             Player player = event.getPlayer();
             for (Hologram hologram : this.holograms.values())
@@ -118,8 +181,17 @@ public class HologramManager extends Manager implements Listener {
         if (hologram == null) {
             hologram = this.nmsHandler.createHologram(location, text);
             this.holograms.put(location, hologram);
-            for (Player player : Bukkit.getOnlinePlayers())
-                this.updateWatcher(player, hologram);
+
+            if (FoliaCompat.isFolia()) {
+                // Initial watchers from region-safe snapshots; the periodic watcher pass keeps them fresh
+                PlayerCacheManager playerCacheManager = this.rosePlugin.getManager(PlayerCacheManager.class);
+                if (playerCacheManager != null)
+                    for (PlayerCacheManager.PlayerSnapshot snapshot : playerCacheManager.getSnapshots())
+                        this.updateWatcher(snapshot, hologram);
+            } else {
+                for (Player player : Bukkit.getOnlinePlayers())
+                    this.updateWatcher(player, hologram);
+            }
         } else {
             hologram.setText(text);
         }

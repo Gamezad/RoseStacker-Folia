@@ -38,6 +38,12 @@ public class WorldListener implements Listener {
         if (this.stackManager.isWorldDisabled(event.getWorld()))
             return;
 
+        StackingThread stackingThread = this.stackManager.getStackingThread(event.getWorld());
+
+        // Folia: start the region-local maintenance task (entity cache refresh + orphan rescan) for this chunk
+        if (stackingThread != null)
+            stackingThread.onChunkLoaded(event.getChunk());
+
         Chunk chunk = event.getChunk();
         if (event.isNewChunk()) {
             // Stack new entities
@@ -68,6 +74,11 @@ public class WorldListener implements Listener {
 
     @EventHandler
     public void onChunkUnload(ChunkUnloadEvent event) {
+        // Folia: cancel the chunk's maintenance task first; everything below runs on the owning region
+        StackingThread stackingThread = this.stackManager.getStackingThread(event.getWorld());
+        if (stackingThread != null)
+            stackingThread.onChunkUnloaded(event.getChunk());
+
         this.stackManager.saveChunkBlocks(event.getChunk(), true);
 
         if (NMSUtil.getVersionNumber() < 17)
