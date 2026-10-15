@@ -754,7 +754,7 @@ public class StackingThread implements StackingLogic, AutoCloseable {
 
         // Region tasks are keyed by chunk coordinates; they run on whichever region owns the chunk
         Location center = new Location(this.targetWorld, (chunk.getX() << 4) + 8, (this.targetWorld.getMinHeight() + this.targetWorld.getMaxHeight()) / 2, (chunk.getZ() << 4) + 8);
-        ScheduledTask task = this.rosePlugin.getScheduler().runTaskTimerAtLocation(center, t -> this.runChunkMaintenance(chunk.getX(), chunk.getZ()), 5L, CHUNK_MAINTENANCE_INTERVAL);
+        ScheduledTask task = this.rosePlugin.getScheduler().runTaskTimerAtLocation(center, () -> this.runChunkMaintenance(chunk.getX(), chunk.getZ()), 5L, CHUNK_MAINTENANCE_INTERVAL);
         this.chunkMaintenanceTasks.put(key, task);
     }
 
