@@ -7,6 +7,7 @@ import dev.rosewood.rosegarden.utils.NMSUtil;
 import dev.rosewood.rosestacker.nms.NMSAdapter;
 import dev.rosewood.rosestacker.nms.NMSHandler;
 import dev.rosewood.rosestacker.stack.StackingThread;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import dev.rosewood.rosestacker.utils.VersionUtils;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -37,6 +38,10 @@ public class EntityCacheManager extends Manager {
 
     @Override
     public void reload() {
+        // On Folia chunks are kept fresh by StackingThread's region-owned chunk maintenance tasks instead
+        if (FoliaCompat.isFolia())
+            return;
+
         this.refreshTask = this.rosePlugin.getScheduler().runTaskTimer(this::refresh, 5L, 60L);
     }
 
@@ -99,6 +104,9 @@ public class EntityCacheManager extends Manager {
     private void filter(Location location, BoundingBox boundingBox, Collection<Entity> entities, Predicate<Entity> predicate, Set<Entity> collector) {
         if (DIRECT_GETTERS) {
             for (Entity entity : entities) {
+                if (!FoliaCompat.canUseEntity(entity)) // Never read another region's entity state on Folia
+                    continue;
+
                 if (boundingBox.contains(entity.getX(), entity.getY(), entity.getZ())
                         && predicate.test(entity)
                         && entity.isValid())
@@ -106,7 +114,15 @@ public class EntityCacheManager extends Manager {
             }
         } else {
             for (Entity entity : entities) {
-                entity.getLocation(location);
+                if (!FoliaCompat.canUseEntity(entity)) // Never read another region's entity state on Folia
+                    continue;
+
+                try {
+                    entity.getLocation(location);
+                } catch (Exception e) {
+                    continue; // Entity state became unavailable mid-iteration
+                }
+
                 if (boundingBox.contains(location.getX(), location.getY(), location.getZ())
                         && predicate.test(entity)
                         && entity.isValid())
@@ -140,9 +156,13 @@ public class EntityCacheManager extends Manager {
         }
 
         Set<Entity> nearbyEntities = new HashSet<>();
-        for (Entity entity : entities)
+        for (Entity entity : entities) {
+            if (!FoliaCompat.canUseEntity(entity)) // Never read another region's entity state on Folia
+                continue;
+
             if (predicate.test(entity) && entity.isValid())
                 nearbyEntities.add(entity);
+        }
 
         return nearbyEntities;
     }
@@ -153,10 +173,55 @@ public class EntityCacheManager extends Manager {
      * @param entity The entity to cache
      */
     public void preCacheEntity(Entity entity) {
+        if (!FoliaCompat.canUseEntity(entity)) // Off-region calls are ignored; the chunk refresh will pick the entity up
+            return;
+
         Location location = entity.getLocation();
         ChunkLocation chunkLocation = new ChunkLocation(entity.getWorld().getName(), (int) location.getX() >> 4, (int) location.getY() >> 4, (int) location.getZ() >> 4);
         Collection<Entity> entities = this.entityCache.computeIfAbsent(chunkLocation, k -> this.createCollection());
         entities.add(entity);
+    }
+
+    /**
+     * Rebuilds the cache entries for a single chunk. Only reads entities of that one chunk, so it is safe
+     * (and much cheaper than a full world scan) when called from the region thread that owns the chunk.
+     * Used on Folia in place of the periodic full-world {@link #refresh()}.
+     *
+     * @param world   the world the chunk belongs to
+     * @param chunkX  the chunk x coordinate
+     * @param chunkZ  the chunk z coordinate
+     * @param entities the current entities of the chunk
+     */
+    public void refreshChunk(World world, int chunkX, int chunkZ, Collection<Entity> entities) {
+        String worldName = world.getName();
+        int minY = world.getMinHeight() >> 4;
+        int maxY = world.getMaxHeight() >> 4;
+        for (int y = minY; y <= maxY; y++)
+            this.entityCache.remove(new ChunkLocation(worldName, chunkX, y, chunkZ));
+
+        if (DIRECT_GETTERS) {
+            for (Entity entity : entities) {
+                EntityType type = entity.getType();
+                if (type != VersionUtils.ITEM && (!type.isAlive() || type == EntityType.PLAYER || type == EntityType.ARMOR_STAND))
+                    continue;
+
+                ChunkLocation chunkLocation = new ChunkLocation(worldName, (int) entity.getX() >> 4, (int) entity.getY() >> 4, (int) entity.getZ() >> 4);
+                Collection<Entity> cacheEntities = this.entityCache.computeIfAbsent(chunkLocation, k -> this.createCollection());
+                cacheEntities.add(entity);
+            }
+        } else {
+            Location location = new Location(world, 0, 0, 0);
+            for (Entity entity : entities) {
+                EntityType type = entity.getType();
+                if (type != VersionUtils.ITEM && (!type.isAlive() || type == EntityType.PLAYER || type == EntityType.ARMOR_STAND))
+                    continue;
+
+                entity.getLocation(location);
+                ChunkLocation chunkLocation = new ChunkLocation(worldName, (int) location.getX() >> 4, (int) location.getY() >> 4, (int) location.getZ() >> 4);
+                Collection<Entity> cacheEntities = this.entityCache.computeIfAbsent(chunkLocation, k -> this.createCollection());
+                cacheEntities.add(entity);
+            }
+        }
     }
 
     private void refresh() {

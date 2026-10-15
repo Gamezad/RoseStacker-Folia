@@ -13,6 +13,7 @@ import dev.rosewood.rosestacker.nms.spawner.SpawnerType;
 import dev.rosewood.rosestacker.nms.spawner.StackedSpawnerTile;
 import dev.rosewood.rosestacker.stack.settings.SpawnerStackSettings;
 import dev.rosewood.rosestacker.stack.settings.conditions.spawner.ConditionTag;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import dev.rosewood.rosestacker.utils.PersistentDataUtils;
 import dev.rosewood.rosestacker.utils.StackerUtils;
 import dev.rosewood.rosestacker.utils.ThreadUtils;
@@ -50,7 +51,7 @@ public class StackedSpawner extends Stack<SpawnerStackSettings> {
         this.spawnerTile = NMSAdapter.getHandler().injectStackedSpawnerTile(this);
         this.stackSettings = RoseStacker.getInstance().getManager(StackSettingManager.class).getSpawnerStackSettings(this.spawnerTile.getSpawnerType());
 
-        ThreadUtils.runOnPrimary(() -> this.updateSpawnerProperties(true));
+        ThreadUtils.runOnPrimary(spawner.getLocation(), () -> this.updateSpawnerProperties(true));
         if (updateDisplay)
             this.updateDisplay();
     }
@@ -139,6 +140,13 @@ public class StackedSpawner extends Stack<SpawnerStackSettings> {
         if (!SettingKey.SPAWNER_DISPLAY_TAGS.get() || this.stackSettings == null)
             return;
 
+        if (!FoliaCompat.canUseBlock(this.block)) {
+            // Folia: spawner state and the hologram armor stand live in the block's region
+            if (this.block != null)
+                ThreadUtils.runSync(this.block.getLocation(), this::updateDisplay);
+            return;
+        }
+
         HologramManager hologramManager = RoseStacker.getInstance().getManager(HologramManager.class);
         LocaleManager localeManager = RoseStacker.getInstance().getManager(LocaleManager.class);
 
@@ -185,6 +193,13 @@ public class StackedSpawner extends Stack<SpawnerStackSettings> {
     }
 
     public void updateSpawnerProperties(boolean resetDelay) {
+        if (!FoliaCompat.canUseBlock(this.block)) {
+            // Folia: spawner tile state may only be touched by the block's region
+            if (this.block != null)
+                ThreadUtils.runSync(this.block.getLocation(), () -> this.updateSpawnerProperties(resetDelay));
+            return;
+        }
+
         // Handle the entity type changing
         SpawnerType spawnerType = this.spawnerTile.getSpawnerType();
         this.stackSettings = RoseStacker.getInstance().getManager(StackSettingManager.class).getSpawnerStackSettings(spawnerType);

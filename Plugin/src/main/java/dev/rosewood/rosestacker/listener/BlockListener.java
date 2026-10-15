@@ -355,9 +355,12 @@ public class BlockListener implements Listener {
         }
 
         if (dropToInventory) {
-            Collection<ItemStack> remainingItems = player.getInventory().addItem(itemsToDrop.toArray(ItemStack[]::new)).values();
-            if (!remainingItems.isEmpty())
-                this.stackManager.preStackItems(remainingItems, player.getLocation().add(0, 1, 0));
+            // Inventory changes must happen on the region that owns the player (Folia)
+            ThreadUtils.runOnPrimary(player, () -> {
+                Collection<ItemStack> remainingItems = player.getInventory().addItem(itemsToDrop.toArray(ItemStack[]::new)).values();
+                if (!remainingItems.isEmpty())
+                    this.stackManager.preStackItems(remainingItems, player.getLocation().add(0, 1, 0));
+            });
         } else {
             this.stackManager.preStackItems(itemsToDrop, dropLocation);
         }
@@ -445,8 +448,8 @@ public class BlockListener implements Listener {
                     continue;
 
                 int finalDestroyAmount = destroyAmount;
-                ThreadUtils.runSync(() -> { // Delay a tick so the items aren't destroyed by the explosion
-                    Location dropLocation = StackerUtils.adjustBlockLocation(block.getLocation());
+                Location dropLocation = StackerUtils.adjustBlockLocation(block.getLocation()); // Captured on the owning region
+                ThreadUtils.runSync(dropLocation, () -> { // Delay a tick so the items aren't destroyed by the explosion
                     if (SettingKey.BLOCK_BREAK_ENTIRE_STACK_INTO_SEPARATE.get()) {
                         ItemStack blockItem = new ItemStack(type, 1);
                         this.stackManager.dropItemStack(blockItem, finalDestroyAmount, dropLocation, true);
@@ -503,8 +506,8 @@ public class BlockListener implements Listener {
                     continue;
 
                 int finalDestroyAmount = destroyAmount;
-                ThreadUtils.runSync(() -> { // Delay a tick so the items aren't destroyed by the explosion
-                    Location dropLocation = StackerUtils.adjustBlockLocation(block.getLocation());
+                Location dropLocation = StackerUtils.adjustBlockLocation(block.getLocation()); // Captured on the owning region
+                ThreadUtils.runSync(dropLocation, () -> { // Delay a tick so the items aren't destroyed by the explosion
                     if (SettingKey.SPAWNER_BREAK_ENTIRE_STACK_INTO_SEPARATE.get()) {
                         ItemStack spawnerItem = ItemUtils.getSpawnerAsStackedItemStack(spawnerType, 1);
                         this.stackManager.dropItemStack(spawnerItem, finalDestroyAmount, dropLocation, true);

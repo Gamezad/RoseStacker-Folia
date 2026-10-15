@@ -138,7 +138,7 @@ public class ItemListener implements Listener {
             event.setCancelled(true);
 
             if (SettingKey.ENTITY_DONT_STACK_IF_HAS_EQUIPMENT.get()) {
-                this.rosePlugin.getScheduler().runTask(() -> {
+                this.rosePlugin.getScheduler().runTaskAtEntity(entity, () -> {
                     StackedEntity stackedEntity = this.stackManager.getStackedEntity(entity);
                     if (stackedEntity != null)
                         this.stackManager.tryUnstackEntity(stackedEntity);

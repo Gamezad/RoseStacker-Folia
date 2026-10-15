@@ -5,6 +5,7 @@ import com.google.common.cache.CacheBuilder;
 import dev.rosewood.rosegarden.RosePlugin;
 import dev.rosewood.rosegarden.compatibility.CompatibilityAdapter;
 import dev.rosewood.rosegarden.scheduler.task.ScheduledTask;
+import dev.rosewood.rosegarden.utils.NMSUtil;
 import dev.rosewood.rosestacker.config.SettingKey;
 import dev.rosewood.rosestacker.event.EntityStackClearEvent;
 import dev.rosewood.rosestacker.event.EntityStackEvent;
@@ -16,6 +17,7 @@ import dev.rosewood.rosestacker.hook.NPCsHook;
 import dev.rosewood.rosestacker.hook.WorldGuardHook;
 import dev.rosewood.rosestacker.manager.EntityCacheManager;
 import dev.rosewood.rosestacker.manager.HologramManager;
+import dev.rosewood.rosestacker.manager.PlayerCacheManager;
 import dev.rosewood.rosestacker.manager.StackManager;
 import dev.rosewood.rosestacker.manager.StackSettingManager;
 import dev.rosewood.rosestacker.nms.NMSAdapter;
@@ -26,6 +28,7 @@ import dev.rosewood.rosestacker.stack.settings.EntityStackSettings;
 import dev.rosewood.rosestacker.stack.settings.ItemStackSettings;
 import dev.rosewood.rosestacker.utils.DataUtils;
 import dev.rosewood.rosestacker.utils.EntityUtils;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import dev.rosewood.rosestacker.utils.ItemUtils;
 import dev.rosewood.rosestacker.utils.PersistentDataUtils;
 import dev.rosewood.rosestacker.utils.StackerUtils;
@@ -70,6 +73,13 @@ public class StackingThread implements StackingLogic, AutoCloseable {
 
     private final static String NEW_METADATA = "RS_new";
 
+    /**
+     * How often (in ticks) each loaded chunk's maintenance task runs on Folia. Matches the previous
+     * full-world entity cache refresh rate; the orphan rescan divides this by
+     * {@link SettingKey#ENTITY_RESCAN_FREQUENCY}.
+     */
+    private final static long CHUNK_MAINTENANCE_INTERVAL = 60L;
+
     private final static Cache<UUID, Boolean> REMOVED_ENTITIES = CacheBuilder.newBuilder().expireAfterWrite(5, TimeUnit.SECONDS).build();
 
     private final RosePlugin rosePlugin;
@@ -81,6 +91,9 @@ public class StackingThread implements StackingLogic, AutoCloseable {
 
     private ScheduledTask entityStackTask, itemStackTask, nametagTask, hologramTask;
     private ScheduledTask entityUnstackTask, entityCleanupTask;
+
+    private final Map<Long, ScheduledTask> chunkMaintenanceTasks;
+    private final Map<Long, Integer> chunkMaintenanceCycles;
 
     private final Map<UUID, StackedEntity> stackedEntities;
     private final Map<UUID, StackedItem> stackedItems;
@@ -115,9 +128,13 @@ public class StackingThread implements StackingLogic, AutoCloseable {
                 this.entityUnstackTask = rosePlugin.getScheduler().runTaskTimerAsync(this::unstackEntities, 5L, unstackFrequency);
 
             long cleanupFrequency = SettingKey.ENTITY_RESCAN_FREQUENCY.get();
-            if (cleanupFrequency > 0)
+            // On Folia the world-wide scan is replaced by region-local per-chunk maintenance tasks
+            if (cleanupFrequency > 0 && !FoliaCompat.isFolia())
                 this.entityCleanupTask = rosePlugin.getScheduler().runTaskTimer(this::cleanupOrphanedEntities, 5L, cleanupFrequency);
         }
+
+        this.chunkMaintenanceTasks = new ConcurrentHashMap<>();
+        this.chunkMaintenanceCycles = new ConcurrentHashMap<>();
 
         this.stackedEntities = new ConcurrentHashMap<>();
         this.stackedItems = new ConcurrentHashMap<>();
@@ -140,17 +157,36 @@ public class StackingThread implements StackingLogic, AutoCloseable {
 
         NMSAdapter.getHandler().hijackRandomSource(targetWorld);
 
-        // Load chunk data for all stacks in the world
-        for (Chunk chunk : this.targetWorld.getLoadedChunks()) {
-            this.loadChunkEntities(Arrays.asList(chunk.getEntities()));
-            this.loadChunkBlocks(chunk);
-        }
+        // Load chunk data for all stacks in the world and start per-chunk maintenance.
+        // On Folia, world-wide entity access is only safe before region threads begin ticking (plugin
+        // startup). If regions are already ticking (e.g. a world loaded at runtime), the scan is skipped
+        // and chunk load events plus StackManager#backfillChunkMaintenance cover every chunk instead.
+        if (FoliaCompat.isFolia() && FoliaCompat.isRegionsTicking()) {
+            this.rosePlugin.getLogger().info("Folia: initial scan of world '" + targetWorld.getName() + "' deferred to chunk load events");
+        } else {
+            try {
+                for (Chunk chunk : this.targetWorld.getLoadedChunks()) {
+                    this.loadChunkEntities(Arrays.asList(chunk.getEntities()));
+                    this.loadChunkBlocks(chunk);
 
-        // Disable AI for all existing stacks in the target world
-        this.targetWorld.getLivingEntities().forEach(PersistentDataUtils::applyDisabledAi);
+                    if (FoliaCompat.isFolia())
+                        this.onChunkLoaded(chunk);
+                }
+
+                this.targetWorld.getLivingEntities().forEach(PersistentDataUtils::applyDisabledAi);
+            } catch (Exception e) {
+                // Folia rejected cross-region world access; chunk events will cover the world instead
+                this.rosePlugin.getLogger().warning("Folia: could not fully scan world '" + targetWorld.getName() + "' (" + e.getMessage() + "), falling back to chunk load events");
+            }
+        }
     }
 
     private void stackEntities() {
+        if (FoliaCompat.isFolia()) {
+            this.stackEntitiesFolia();
+            return;
+        }
+
         if (this.stackingEntities)
             return;
 
@@ -174,7 +210,78 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         }
     }
 
+    /**
+     * Folia variant of {@link #stackEntities()}. The driver stays async (it only walks plugin-side
+     * maps), but every per-stack operation is executed on the region that owns the stack's entity so
+     * entity state is only ever touched by its owning region.
+     */
+    private void stackEntitiesFolia() {
+        if (this.stackingEntities)
+            return;
+
+        boolean entityStackingEnabled = this.stackManager.isEntityStackingEnabled();
+        if (!entityStackingEnabled || this.stackManager.isEntityStackingTemporarilyDisabled())
+            return;
+
+        this.stackingEntities = true;
+        try {
+            for (StackedEntity stackedEntity : this.stackedEntities.values()) {
+                LivingEntity livingEntity = stackedEntity.getEntity();
+                if (livingEntity == null)
+                    continue;
+
+                this.runOnEntityRegion(livingEntity, () -> {
+                    if (this.isRemoved(livingEntity)) {
+                        this.removeEntityStack(stackedEntity);
+                        return;
+                    }
+
+                    this.tryStackEntity(stackedEntity);
+                });
+            }
+        } finally {
+            this.stackingEntities = false;
+        }
+    }
+
+    /**
+     * Runs the task immediately when the current thread already owns the entity's region, otherwise
+     * schedules it onto the owning region. Folia only.
+     *
+     * @param entity the entity the task will touch
+     * @param task   the task to run
+     */
+    private void runOnEntityRegion(Entity entity, Runnable task) {
+        if (FoliaCompat.canUseEntity(entity)) {
+            task.run();
+        } else {
+            this.rosePlugin.getScheduler().runTaskAtEntity(entity, task);
+        }
+    }
+
+    /**
+     * Line of sight check that survives cross-region raycasts on Folia. If the raycast crosses into a
+     * region this thread does not own the world read fails, in which case the entities are conservatively
+     * treated as not being in line of sight. Never throws.
+     *
+     * @param entity      the entity looking
+     * @param otherEntity the entity being looked at
+     * @return true if there is line of sight (or the check is unavailable, falling back to false)
+     */
+    private boolean hasLineOfSightSafe(LivingEntity entity, Entity otherEntity) {
+        try {
+            return EntityUtils.hasLineOfSight(entity, otherEntity, 0.75, false);
+        } catch (Throwable e) {
+            return false;
+        }
+    }
+
     private void unstackEntities() {
+        if (FoliaCompat.isFolia()) {
+            this.unstackEntitiesFolia();
+            return;
+        }
+
         if (this.unstackingEntities)
             return;
 
@@ -191,14 +298,48 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         }
     }
 
+    /**
+     * Folia variant of {@link #unstackEntities()}, deferring each stack to its owning region
+     */
+    private void unstackEntitiesFolia() {
+        if (this.unstackingEntities)
+            return;
+
+        boolean entityStackingEnabled = this.stackManager.isEntityStackingEnabled();
+        if (!entityStackingEnabled || this.stackManager.isEntityUnstackingTemporarilyDisabled())
+            return;
+
+        this.unstackingEntities = true;
+        try {
+            for (StackedEntity stackedEntity : this.stackedEntities.values()) {
+                LivingEntity livingEntity = stackedEntity.getEntity();
+                if (livingEntity == null)
+                    continue;
+
+                this.runOnEntityRegion(livingEntity, () -> this.tryUnstackEntity(stackedEntity));
+            }
+        } finally {
+            this.unstackingEntities = false;
+        }
+    }
+
     @Override
     public void tryUnstackEntity(StackedEntity stackedEntity) {
         LivingEntity entity = stackedEntity.getEntity();
-        if (entity == null || stackedEntity.getStackSize() <= 1 || !entity.isValid())
+        if (entity == null)
+            return;
+
+        if (!FoliaCompat.canUseEntity(entity)) {
+            // Folia: entity state may only be touched by the owning region
+            this.runOnEntityRegion(entity, () -> this.tryUnstackEntity(stackedEntity));
+            return;
+        }
+
+        if (stackedEntity.getStackSize() <= 1 || !entity.isValid())
             return;
 
         if (!stackedEntity.shouldStayStacked()) {
-            ThreadUtils.runSync(() -> {
+            ThreadUtils.runSync(entity, () -> {
                 if (stackedEntity.getStackSize() > 1)
                     this.splitEntityStack(stackedEntity);
             });
@@ -212,29 +353,43 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         NMSHandler nmsHandler = NMSAdapter.getHandler();
         StackedEntityDataStorage nbt = stackedEntity.getDataStorage();
         stackedEntity.setDataStorage(nmsHandler.createEntityDataStorage(entity, this.stackManager.getEntityDataStorageType(entity.getType())));
-        ThreadUtils.runSync(() -> {
+        ThreadUtils.runSync(entity, () -> {
             for (EntityDataEntry entityDataEntry : nbt.getAll())
                 entityDataEntry.createEntity(stackedEntity.getLocation(), true, entity.getType());
         });
     }
 
     private void cleanupOrphanedEntities() {
-        for (Entity entity : this.targetWorld.getEntities()) {
-            if (this.isRemoved(entity))
-                continue;
+        for (Entity entity : this.targetWorld.getEntities())
+            this.processOrphanedEntity(entity);
+    }
 
-            if (entity instanceof LivingEntity livingEntity && entity.getType() != EntityType.ARMOR_STAND && entity.getType() != EntityType.PLAYER && !this.isEntityStacked(livingEntity)) {
-                if (!this.stackManager.isAreaDisabled(entity.getLocation()))
-                    this.createEntityStack(livingEntity, false);
-            } else if (entity.getType() == VersionUtils.ITEM) {
-                Item item = (Item) entity;
-                if (!this.isItemStacked(item) && !this.stackManager.isAreaDisabled(entity.getLocation()))
-                    this.createItemStack(item, false);
-            }
+    /**
+     * Applies the orphaned-entity rescan logic to a single entity. On Folia this must run on the region
+     * that owns the entity (see the per-chunk maintenance task), elsewhere it runs from the world-wide scan.
+     *
+     * @param entity the entity to check
+     */
+    private void processOrphanedEntity(Entity entity) {
+        if (this.isRemoved(entity))
+            return;
+
+        if (entity instanceof LivingEntity livingEntity && entity.getType() != EntityType.ARMOR_STAND && entity.getType() != EntityType.PLAYER && !this.isEntityStacked(livingEntity)) {
+            if (!this.stackManager.isAreaDisabled(entity.getLocation()))
+                this.createEntityStack(livingEntity, false);
+        } else if (entity.getType() == VersionUtils.ITEM) {
+            Item item = (Item) entity;
+            if (!this.isItemStacked(item) && !this.stackManager.isAreaDisabled(entity.getLocation()))
+                this.createItemStack(item, false);
         }
     }
 
     private void stackItems() {
+        if (FoliaCompat.isFolia()) {
+            this.stackItemsFolia();
+            return;
+        }
+
         if (this.stackingItems)
             return;
 
@@ -263,7 +418,49 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         }
     }
 
+    /**
+     * Folia variant of {@link #stackItems()}, deferring each item stack to its owning region
+     */
+    private void stackItemsFolia() {
+        if (this.stackingItems)
+            return;
+
+        boolean itemStackingEnabled = this.stackManager.isItemStackingEnabled();
+        if (!itemStackingEnabled)
+            return;
+
+        boolean updateItemNametags = SettingKey.ITEM_DISPLAY_DESPAWN_TIMER_PLACEHOLDER.get();
+
+        this.stackingItems = true;
+        try {
+            for (StackedItem stackedItem : this.stackedItems.values()) {
+                Item item = stackedItem.getItem();
+                if (item == null)
+                    continue;
+
+                this.runOnEntityRegion(item, () -> {
+                    if (this.isRemoved(item)) {
+                        this.removeItemStack(stackedItem);
+                        return;
+                    }
+
+                    if (updateItemNametags)
+                        stackedItem.updateDisplay();
+
+                    this.tryStackItem(stackedItem);
+                });
+            }
+        } finally {
+            this.stackingItems = false;
+        }
+    }
+
     public void processNametags() {
+        if (FoliaCompat.isFolia()) {
+            this.processNametagsFolia();
+            return;
+        }
+
         if (this.updatingNametags)
             return;
 
@@ -363,6 +560,135 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         }
     }
 
+    /**
+     * Folia variant of {@link #processNametags()}. Each stack's nametag work is executed on the region
+     * that owns its entity, and player positions/inventories are read from {@link PlayerCacheManager}
+     * snapshots (which are updated on each player's own region) so no other region's state is ever read.
+     * Line-of-sight raycasts may cross regions and fall back to "visible" if the world can't be read.
+     */
+    private void processNametagsFolia() {
+        if (this.updatingNametags)
+            return;
+
+        if (!this.dynamicEntityTags && !this.dynamicItemTags)
+            return;
+
+        PlayerCacheManager playerCacheManager = this.rosePlugin.getManager(PlayerCacheManager.class);
+        if (playerCacheManager == null)
+            return;
+
+        this.updatingNametags = true;
+        try {
+            if (this.dynamicEntityTags) {
+                for (StackedEntity stackedEntity : this.stackedEntities.values()) {
+                    LivingEntity livingEntity = stackedEntity.getEntity();
+                    if (livingEntity == null)
+                        continue;
+
+                    this.runOnEntityRegion(livingEntity, () -> this.updateStackedEntityNametag(stackedEntity, playerCacheManager));
+                }
+            }
+
+            if (this.dynamicItemTags) {
+                for (StackedItem stackedItem : this.stackedItems.values()) {
+                    Item item = stackedItem.getItem();
+                    if (item == null)
+                        continue;
+
+                    this.runOnEntityRegion(item, () -> this.updateStackedItemNametag(stackedItem, playerCacheManager));
+                }
+            }
+        } finally {
+            this.updatingNametags = false;
+        }
+    }
+
+    private void updateStackedEntityNametag(StackedEntity stackedEntity, PlayerCacheManager playerCacheManager) {
+        LivingEntity entity = stackedEntity.getEntity();
+        if (entity == null || this.isRemoved(entity))
+            return;
+
+        NMSHandler nmsHandler = NMSAdapter.getHandler();
+        String displayName = stackedEntity.getDisplayName();
+        boolean displayNameVisible = stackedEntity.isDisplayNameVisible();
+
+        Location entityLocation = entity.getLocation();
+        double particleHeight = entity.getEyeHeight(true) + 0.75;
+        boolean displayStackingToolParticles;
+
+        for (PlayerCacheManager.PlayerSnapshot snapshot : playerCacheManager.getWorldSnapshots(this.targetWorld.getName())) {
+            double dx = snapshot.getX() - entityLocation.getX();
+            double dy = snapshot.getY() - entityLocation.getY();
+            double dz = snapshot.getZ() - entityLocation.getZ();
+            double distanceSqrd = dx * dx + dy * dy + dz * dz;
+
+            if (distanceSqrd > StackerUtils.ASSUMED_ENTITY_VISIBILITY_RANGE)
+                continue;
+
+            Player player = Bukkit.getPlayer(snapshot.getPlayerId());
+            if (player == null)
+                continue;
+
+            boolean visible = distanceSqrd < this.entityDynamicViewRangeSqrd;
+            if (visible && this.entityDynamicWallDetection) {
+                try {
+                    visible &= EntityUtils.hasLineOfSight(player, entity, 0.75, true);
+                } catch (Throwable e) {
+                    // The raycast crossed into a region we don't own; treat as visible rather than failing
+                }
+            }
+
+            nmsHandler.updateEntityNameTagForPlayer(player, entity, displayName, displayNameVisible && visible);
+
+            // Spawn particles for holding the stacking tool
+            displayStackingToolParticles = snapshot.isStackingTool();
+            if (visible && displayStackingToolParticles) {
+                Location location = entityLocation.clone().add(0, particleHeight, 0);
+                DustOptions dustOptions;
+                if (PersistentDataUtils.isUnstackable(entity)) {
+                    dustOptions = StackerUtils.UNSTACKABLE_DUST_OPTIONS;
+                } else {
+                    dustOptions = StackerUtils.STACKABLE_DUST_OPTIONS;
+                }
+                player.spawnParticle(VersionUtils.DUST, location, 1, 0.0, 0.0, 0.0, 0.0, dustOptions);
+            }
+        }
+    }
+
+    private void updateStackedItemNametag(StackedItem stackedItem, PlayerCacheManager playerCacheManager) {
+        Item item = stackedItem.getItem();
+        if (item == null || this.isRemoved(item) || !item.isCustomNameVisible())
+            return;
+
+        NMSHandler nmsHandler = NMSAdapter.getHandler();
+        Location itemLocation = item.getLocation();
+
+        for (PlayerCacheManager.PlayerSnapshot snapshot : playerCacheManager.getWorldSnapshots(this.targetWorld.getName())) {
+            double dx = snapshot.getX() - itemLocation.getX();
+            double dy = snapshot.getY() - itemLocation.getY();
+            double dz = snapshot.getZ() - itemLocation.getZ();
+            double distanceSqrd = dx * dx + dy * dy + dz * dz;
+
+            if (distanceSqrd > StackerUtils.ASSUMED_ENTITY_VISIBILITY_RANGE)
+                continue;
+
+            Player player = Bukkit.getPlayer(snapshot.getPlayerId());
+            if (player == null)
+                continue;
+
+            boolean visible = distanceSqrd < this.itemDynamicViewRangeSqrd;
+            if (visible && this.itemDynamicWallDetection) {
+                try {
+                    visible &= EntityUtils.hasLineOfSight(player, item, 0.75, true);
+                } catch (Throwable e) {
+                    // The raycast crossed into a region we don't own; treat as visible rather than failing
+                }
+            }
+
+            nmsHandler.updateEntityNameTagVisibilityForPlayer(player, item, visible);
+        }
+    }
+
     private void updateHolograms() {
         if (this.updatingHolograms)
             return;
@@ -396,8 +722,129 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         if (this.entityCleanupTask != null)
             this.entityCleanupTask.cancel();
 
+        // Cancel per-chunk maintenance tasks (Folia)
+        for (ScheduledTask chunkTask : this.chunkMaintenanceTasks.values()) {
+            try {
+                chunkTask.cancel();
+            } catch (Throwable e) {
+                // Ignore, task handles may already be retired
+            }
+        }
+        this.chunkMaintenanceTasks.clear();
+        this.chunkMaintenanceCycles.clear();
+
         // Save all data
         this.saveAllData(true);
+    }
+
+    /**
+     * Schedules the per-chunk maintenance task for a loaded chunk if it doesn't have one yet.
+     * Folia only; must be called from the region that owns the chunk (chunk load events) or while
+     * region ticking has not started (plugin startup backfill).
+     *
+     * @param chunk the chunk that was loaded
+     */
+    public void onChunkLoaded(Chunk chunk) {
+        if (this.disabled || !FoliaCompat.isFolia())
+            return;
+
+        long key = chunkKey(chunk.getX(), chunk.getZ());
+        if (this.chunkMaintenanceTasks.containsKey(key))
+            return;
+
+        // Region tasks are keyed by chunk coordinates; they run on whichever region owns the chunk
+        Location center = new Location(this.targetWorld, (chunk.getX() << 4) + 8, (this.targetWorld.getMinHeight() + this.targetWorld.getMaxHeight()) / 2, (chunk.getZ() << 4) + 8);
+        ScheduledTask task = this.rosePlugin.getScheduler().runTaskTimerAtLocation(center, t -> this.runChunkMaintenance(chunk.getX(), chunk.getZ()), 5L, CHUNK_MAINTENANCE_INTERVAL);
+        this.chunkMaintenanceTasks.put(key, task);
+    }
+
+    /**
+     * Cancels the per-chunk maintenance task for an unloaded chunk
+     *
+     * @param chunk the chunk that was unloaded
+     */
+    public void onChunkUnloaded(Chunk chunk) {
+        if (!FoliaCompat.isFolia())
+            return;
+
+        long key = chunkKey(chunk.getX(), chunk.getZ());
+        this.chunkMaintenanceCycles.remove(key);
+        ScheduledTask task = this.chunkMaintenanceTasks.remove(key);
+        if (task != null) {
+            try {
+                task.cancel();
+            } catch (Throwable e) {
+                // Ignore, task handles may already be retired
+            }
+        }
+    }
+
+    /**
+     * Rebuilds the entity cache for a single chunk and periodically rescans it for entities the plugin
+     * may have missed. Runs as a repeating task on the region that owns the chunk, replacing Folia's
+     * unsupported full-world scans with cheap region-local work.
+     *
+     * @param chunkX the chunk x coordinate
+     * @param chunkZ the chunk z coordinate
+     */
+    private void runChunkMaintenance(int chunkX, int chunkZ) {
+        if (this.disabled || !FoliaCompat.isFolia())
+            return;
+
+        if (!this.targetWorld.isChunkLoaded(chunkX, chunkZ))
+            return;
+
+        Chunk chunk = this.targetWorld.getChunkAt(chunkX, chunkZ);
+        Entity[] entities;
+        try {
+            entities = chunk.getEntities(); // Owning region only
+        } catch (Exception e) {
+            return;
+        }
+
+        // Refresh cache membership for this chunk (entity reads are safe, we own the chunk)
+        this.entityCacheManager.refreshChunk(this.targetWorld, chunkX, chunkZ, Arrays.asList(entities));
+
+        // Periodically rescan for missed entities
+        long rescanFrequency = SettingKey.ENTITY_RESCAN_FREQUENCY.get();
+        if (rescanFrequency <= 0)
+            return;
+
+        long intervalCycles = Math.max(1, rescanFrequency / CHUNK_MAINTENANCE_INTERVAL);
+        long key = chunkKey(chunkX, chunkZ);
+        int cycle = this.chunkMaintenanceCycles.merge(key, 1, Integer::sum);
+        if (cycle >= intervalCycles) {
+            this.chunkMaintenanceCycles.put(key, 1);
+            for (Entity entity : entities)
+                this.processOrphanedEntity(entity);
+        }
+    }
+
+    /**
+     * Schedules per-chunk maintenance for every loaded chunk that doesn't have a task yet, and loads
+     * stack data for chunks the plugin never processed. Idempotent. See
+     * {@link dev.rosewood.rosestacker.manager.StackManager#backfillChunkMaintenance()}.
+     */
+    public void backfillChunkMaintenance() {
+        if (this.disabled || !FoliaCompat.isFolia())
+            return;
+
+        try {
+            for (Chunk chunk : this.targetWorld.getLoadedChunks()) {
+                if (this.chunkMaintenanceTasks.containsKey(chunkKey(chunk.getX(), chunk.getZ())))
+                    continue; // Already covered by the startup scan or chunk load events
+
+                this.loadChunkEntities(Arrays.asList(chunk.getEntities()));
+                this.loadChunkBlocks(chunk);
+                this.onChunkLoaded(chunk);
+            }
+        } catch (Exception e) {
+            this.rosePlugin.getLogger().warning("Folia: could not backfill chunk maintenance for world '" + this.targetWorld.getName() + "' (" + e.getMessage() + ")");
+        }
+    }
+
+    private static long chunkKey(int chunkX, int chunkZ) {
+        return ((long) chunkX << 32) | (chunkZ & 0xFFFFFFFFL);
     }
 
     @Override
@@ -540,8 +987,17 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         if (entityStackClearEvent.isCancelled())
             return 0;
 
-        toRemove.stream().map(StackedEntity::getEntity).forEach(this::setRemoved);
-        toRemove.stream().map(StackedEntity::getEntity).forEach(LivingEntity::remove);
+        if (FoliaCompat.isFolia()) {
+            // Each entity removal is routed to its owning region
+            for (StackedEntity stackedEntity : toRemove) {
+                LivingEntity entity = stackedEntity.getEntity();
+                this.setRemoved(entity);
+                this.rosePlugin.getScheduler().runTaskAtEntity(entity, () -> entity.remove());
+            }
+        } else {
+            toRemove.stream().map(StackedEntity::getEntity).forEach(this::setRemoved);
+            toRemove.stream().map(StackedEntity::getEntity).forEach(LivingEntity::remove);
+        }
         this.stackedEntities.values().removeIf(toRemove::contains);
 
         return toRemove.size();
@@ -556,8 +1012,17 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         if (itemStackClearEvent.isCancelled())
             return 0;
 
-        toRemove.stream().map(StackedItem::getItem).forEach(this::setRemoved);
-        toRemove.stream().map(StackedItem::getItem).forEach(Item::remove);
+        if (FoliaCompat.isFolia()) {
+            // Each entity removal is routed to its owning region
+            for (StackedItem stackedItem : toRemove) {
+                Item item = stackedItem.getItem();
+                this.setRemoved(item);
+                this.rosePlugin.getScheduler().runTaskAtEntity(item, () -> item.remove());
+            }
+        } else {
+            toRemove.stream().map(StackedItem::getItem).forEach(this::setRemoved);
+            toRemove.stream().map(StackedItem::getItem).forEach(Item::remove);
+        }
         this.stackedItems.values().removeIf(toRemove::contains);
 
         return toRemove.size();
@@ -571,6 +1036,12 @@ public class StackingThread implements StackingLogic, AutoCloseable {
 
     @Override
     public StackedEntity splitEntityStack(StackedEntity stackedEntity) {
+        if (!FoliaCompat.canUseEntity(stackedEntity.getEntity())) {
+            // Folia: defer to the owning region, the caller receives null and the split completes asynchronously
+            this.runOnEntityRegion(stackedEntity.getEntity(), () -> this.splitEntityStack(stackedEntity));
+            return null;
+        }
+
         EntityUnstackEvent entityUnstackEvent = new EntityUnstackEvent(stackedEntity, new StackedEntity(stackedEntity.getEntity()));
         Bukkit.getPluginManager().callEvent(entityUnstackEvent);
         if (entityUnstackEvent.isCancelled())
@@ -605,6 +1076,12 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         if (!this.stackManager.isEntityStackingEnabled())
             return null;
 
+        if (!FoliaCompat.canUseEntity(livingEntity)) {
+            // Folia: entity state may only be touched by the owning region, the stack appears asynchronously
+            this.runOnEntityRegion(livingEntity, () -> this.createEntityStack(livingEntity, tryStack));
+            return null;
+        }
+
         if (livingEntity instanceof Player || livingEntity instanceof ArmorStand || NPCsHook.isNPC(livingEntity))
             return null;
 
@@ -629,6 +1106,12 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         if (!this.stackManager.isItemStackingEnabled())
             return null;
 
+        if (!FoliaCompat.canUseEntity(item)) {
+            // Folia: entity state may only be touched by the owning region, the stack appears asynchronously
+            this.runOnEntityRegion(item, () -> this.createItemStack(item, tryStack));
+            return null;
+        }
+
         ItemStackSettings itemStackSettings = this.rosePlugin.getManager(StackSettingManager.class).getItemStackSettings(item);
         if (itemStackSettings != null && !itemStackSettings.isStackingEnabled())
             return null;
@@ -651,6 +1134,12 @@ public class StackingThread implements StackingLogic, AutoCloseable {
 
     @Override
     public StackedBlock createBlockStack(Block block, int amount) {
+        if (!FoliaCompat.canUseBlock(block)) {
+            // Folia: block state may only be touched by the owning region, the stack appears asynchronously
+            this.rosePlugin.getScheduler().runTaskAtLocation(block.getLocation(), () -> this.createBlockStack(block, amount));
+            return null;
+        }
+
         if (!this.stackManager.isBlockStackingEnabled() || !this.stackManager.isBlockTypeStackable(block))
             return null;
 
@@ -662,6 +1151,12 @@ public class StackingThread implements StackingLogic, AutoCloseable {
 
     @Override
     public StackedSpawner createSpawnerStack(Block block, int amount, boolean placedByPlayer) {
+        if (!FoliaCompat.canUseBlock(block)) {
+            // Folia: block state may only be touched by the owning region, the stack appears asynchronously
+            this.rosePlugin.getScheduler().runTaskAtLocation(block.getLocation(), () -> this.createSpawnerStack(block, amount, placedByPlayer));
+            return null;
+        }
+
         if (block.getType() != Material.SPAWNER)
             return null;
 
@@ -702,7 +1197,13 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         if (world == null)
             return;
 
-        ThreadUtils.runAsync(() -> {
+        if (!FoliaCompat.canUseLocation(location)) {
+            // Folia: defer to the region that owns the spawn location, the stack appears asynchronously
+            this.rosePlugin.getScheduler().runTaskAtLocation(location, () -> this.preStackEntities(entityType, amount, location, spawnReason));
+            return;
+        }
+
+        Runnable preStackTask = () -> {
             EntityStackSettings stackSettings = this.rosePlugin.getManager(StackSettingManager.class).getEntityStackSettings(entityType);
             NMSHandler nmsHandler = NMSAdapter.getHandler();
             boolean removeAi = stackSettings.isMobAIDisabled();
@@ -753,7 +1254,7 @@ public class StackingThread implements StackingLogic, AutoCloseable {
 
             updatedEntities.forEach(StackedEntity::updateDisplay);
 
-            ThreadUtils.runSync(() -> {
+            ThreadUtils.runSync(location, () -> {
                 this.stackManager.setEntityStackingTemporarilyDisabled(true);
                 for (StackedEntity stackedEntity : newStackedEntities) {
                     LivingEntity entity = stackedEntity.getEntity();
@@ -767,7 +1268,14 @@ public class StackingThread implements StackingLogic, AutoCloseable {
                 }
                 this.stackManager.setEntityStackingTemporarilyDisabled(false);
             });
-        });
+        };
+
+        if (FoliaCompat.isFolia()) {
+            // Folia: nearby entity queries and NMS entity creation require the owning region thread
+            preStackTask.run();
+        } else {
+            ThreadUtils.runAsync(preStackTask);
+        }
     }
 
     private StackedEntity createNewEntity(NMSHandler nmsHandler, EntityType entityType, Location location, SpawnReason spawnReason, boolean removeAi) {
@@ -787,6 +1295,12 @@ public class StackingThread implements StackingLogic, AutoCloseable {
     public void preStackItems(Collection<ItemStack> items, Location location, boolean dropNaturally) {
         if (location.getWorld() == null)
             return;
+
+        if (!FoliaCompat.canUseLocation(location)) {
+            // Folia: defer to the region that owns the drop location; the items appear asynchronously
+            this.rosePlugin.getScheduler().runTaskAtLocation(location, () -> this.preStackItems(items, location, dropNaturally));
+            return;
+        }
 
         // Merge items and store their amounts
         Map<ItemStack, Integer> itemStackAmounts = ItemUtils.reduceItemsByCounts(items);
@@ -847,6 +1361,12 @@ public class StackingThread implements StackingLogic, AutoCloseable {
     public StackedItem dropItemStack(ItemStack itemStack, int amount, Location location, boolean dropNaturally) {
         if (location.getWorld() == null)
             return null;
+
+        if (!FoliaCompat.canUseLocation(location)) {
+            // Folia: defer to the region that owns the drop location; the stack appears asynchronously
+            this.rosePlugin.getScheduler().runTaskAtLocation(location, () -> this.dropItemStack(itemStack, amount, location, dropNaturally));
+            return null;
+        }
 
         if (!this.stackManager.isItemStackingEnabled()) {
             ItemStack clone = itemStack.clone();
@@ -1042,6 +1562,48 @@ public class StackingThread implements StackingLogic, AutoCloseable {
     }
 
     /**
+     * Autosave entry point. On Folia each save is routed to the region that owns the data so no other
+     * region's state is touched; on other platforms this behaves exactly like {@link #saveAllData(boolean)}
+     * with {@code clearStored} false.
+     */
+    public void autosave() {
+        if (!FoliaCompat.isFolia()) {
+            this.saveAllData(false);
+            return;
+        }
+
+        // Blocks and spawners: save each chunk's data from the region that owns the chunk
+        for (Map.Entry<Chunk, StackChunkData> entry : this.stackChunkData.entrySet()) {
+            StackChunkData stackChunkData = entry.getValue();
+            Block anchor = stackChunkData.getSpawners().keySet().stream().findFirst().orElse(null);
+            if (anchor == null)
+                anchor = stackChunkData.getBlocks().keySet().stream().findFirst().orElse(null);
+            if (anchor == null)
+                continue;
+
+            Chunk chunk = entry.getKey();
+            this.rosePlugin.getScheduler().runTaskAtLocation(anchor.getLocation(), () -> this.saveChunkBlocks(chunk, false));
+        }
+
+        // Entities and items: save each stack's data from the region that owns its entity
+        for (StackedEntity stackedEntity : this.stackedEntities.values()) {
+            LivingEntity entity = stackedEntity.getEntity();
+            if (entity == null)
+                continue;
+
+            this.rosePlugin.getScheduler().runTaskAtEntity(entity, () -> DataUtils.writeStackedEntity(stackedEntity));
+        }
+
+        for (StackedItem stackedItem : this.stackedItems.values()) {
+            Item item = stackedItem.getItem();
+            if (item == null)
+                continue;
+
+            this.rosePlugin.getScheduler().runTaskAtEntity(item, () -> DataUtils.writeStackedItem(stackedItem));
+        }
+    }
+
+    /**
      * Tries to stack a StackedEntity with all other StackedEntities
      *
      * @param stackedEntity the StackedEntity to try to stack
@@ -1050,6 +1612,12 @@ public class StackingThread implements StackingLogic, AutoCloseable {
     public void tryStackEntity(StackedEntity stackedEntity) {
         if (this.disabled)
             return;
+
+        if (!FoliaCompat.canUseEntity(stackedEntity.getEntity())) {
+            // Folia: entity state may only be touched by the owning region
+            this.runOnEntityRegion(stackedEntity.getEntity(), () -> this.tryStackEntity(stackedEntity));
+            return;
+        }
 
         EntityStackSettings stackSettings = stackedEntity.getStackSettings();
         if (stackSettings == null)
@@ -1085,7 +1653,7 @@ public class StackingThread implements StackingLogic, AutoCloseable {
                 continue;
 
             if (stackSettings.testCanStackWith(stackedEntity, other, false)
-                    && (!SettingKey.ENTITY_REQUIRE_LINE_OF_SIGHT.get() || EntityUtils.hasLineOfSight(entity, otherEntity, 0.75, false))
+                    && (!SettingKey.ENTITY_REQUIRE_LINE_OF_SIGHT.get() || this.hasLineOfSightSafe(entity, otherEntity))
                     && WorldGuardHook.testLocation(otherEntity.getLocation()))
                 targetEntities.add(other);
         }
@@ -1132,13 +1700,28 @@ public class StackingThread implements StackingLogic, AutoCloseable {
             this.removeEntityStack(toStack);
         }
 
-        ThreadUtils.runOnPrimary(() -> removable.stream().map(StackedEntity::getEntity).forEach(Entity::remove));
+        if (FoliaCompat.isFolia()) {
+            // Candidates are guaranteed to be owned by this region (cache filter), so removals can run inline
+            for (StackedEntity toRemove : removable) {
+                LivingEntity removeEntity = toRemove.getEntity();
+                if (removeEntity != null)
+                    ThreadUtils.runOnPrimary(removeEntity, removeEntity::remove);
+            }
+        } else {
+            ThreadUtils.runOnPrimary(() -> removable.stream().map(StackedEntity::getEntity).forEach(Entity::remove));
+        }
     }
 
     @Override
     public void tryStackItem(StackedItem stackedItem) {
         if (this.disabled)
             return;
+
+        if (!FoliaCompat.canUseEntity(stackedItem.getItem())) {
+            // Folia: entity state may only be touched by the owning region
+            this.runOnEntityRegion(stackedItem.getItem(), () -> this.tryStackItem(stackedItem));
+            return;
+        }
 
         ItemStackSettings stackSettings = stackedItem.getStackSettings();
         Item item = stackedItem.getItem();
@@ -1205,7 +1788,14 @@ public class StackingThread implements StackingLogic, AutoCloseable {
             increased.getItem().setPickupDelay(Math.max(increased.getItem().getPickupDelay(), removed.getItem().getPickupDelay()));
             removed.getItem().setPickupDelay(100); // Don't allow the item we just merged to get picked up or stacked
 
-            ThreadUtils.runOnPrimary(() -> removed.getItem().remove());
+            if (FoliaCompat.isFolia()) {
+                // The removed item is owned by this region (cache filter); remove inline like the original does on the primary thread
+                Item removedItem = removed.getItem();
+                if (removedItem != null)
+                    ThreadUtils.runOnPrimary(removedItem, removedItem::remove);
+            } else {
+                ThreadUtils.runOnPrimary(() -> removed.getItem().remove());
+            }
             this.removeItemStack(removed);
         }
 
