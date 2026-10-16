@@ -27,6 +27,8 @@ public final class PersistentDataUtils {
     private static final String SPAWNED_FROM_TRIAL_SPAWNER_METADATA_NAME = "trial_spawner_spawned";
     private static final String TOTAL_SPAWNS_METADATA_NAME = "total_spawns";
 
+    private static boolean mobAiDisabledLogged;
+
     public static void setUnstackable(Entity entity, boolean unstackable) {
         RosePlugin rosePlugin = RoseStacker.getInstance();
         if (unstackable) {
@@ -47,6 +49,25 @@ public final class PersistentDataUtils {
         NamespacedKey key = new NamespacedKey(rosePlugin, NO_AI_METADATA_NAME);
         if (!dataContainer.has(key, PersistentDataType.INTEGER))
             dataContainer.set(key, PersistentDataType.INTEGER, 1);
+
+        if (!mobAiDisabledLogged) {
+            // Log once so it is obvious why mobs appear to have no AI (they don't move, can't be knocked
+            // back and are silent) instead of it looking like a bug
+            mobAiDisabledLogged = true;
+            EntityStackSettings entityStackSettings = RoseStacker.getInstance().getManager(StackSettingManager.class).getEntityStackSettings(entity.getType());
+            String source;
+            if (entityStackSettings != null && entityStackSettings.isMobAIDisabled()) {
+                source = "the 'disable-all-mob-ai' entity setting for " + entity.getType();
+            } else if (SettingKey.SPAWNER_DISABLE_MOB_AI.get()) {
+                source = "global-spawner-settings.disable-mob-ai in config.yml";
+            } else {
+                source = "a per-spawner 'disable-mob-ai' setting";
+            }
+
+            rosePlugin.getLogger().info("Mob AI is being disabled because of " + source
+                    + ". Mobs with disabled AI will not move, cannot be knocked back and are silent. "
+                    + "Set it to false and restart if they should keep their AI.");
+        }
 
         applyDisabledAi(entity);
     }

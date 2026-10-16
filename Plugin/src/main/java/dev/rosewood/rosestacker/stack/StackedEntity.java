@@ -66,6 +66,8 @@ import org.jetbrains.annotations.Nullable;
 
 public class StackedEntity extends Stack<EntityStackSettings> implements Comparable<StackedEntity> {
 
+    private static boolean killerPropagationErrorLogged;
+
     private LivingEntity entity;
     private StackedEntityDataStorage stackedEntityDataStorage;
     private int npcCheckCounter;
@@ -469,12 +471,22 @@ public class StackedEntity extends Stack<EntityStackSettings> implements Compara
 
         NMSHandler nmsHandler = NMSAdapter.getHandler();
         for (LivingEntity entity : stackEntities) {
-            // Propagate fire ticks and last damage cause
-            entity.setFireTicks(mainEntity.getFireTicks());
-            if (fromSpawner)
-                SpawnerFlagPersistenceHook.flagSpawnerSpawned(entity);
-            nmsHandler.setLastHurtBy(entity, killer);
-            entity.setLastDamageCause(propagateKiller ? mainEntity.getLastDamageCause() : null);
+            // These are cosmetic copies onto simulated entities. A failure here (for example a server build
+            // that is missing an NMS method this plugin was compiled against) must never abort the rest of
+            // the loot calculation, otherwise the whole stack drops nothing.
+            try {
+                // Propagate fire ticks and last damage cause
+                entity.setFireTicks(mainEntity.getFireTicks());
+                if (fromSpawner)
+                    SpawnerFlagPersistenceHook.flagSpawnerSpawned(entity);
+                nmsHandler.setLastHurtBy(entity, killer);
+                entity.setLastDamageCause(propagateKiller ? mainEntity.getLastDamageCause() : null);
+            } catch (Exception | LinkageError e) {
+                if (!killerPropagationErrorLogged) {
+                    killerPropagationErrorLogged = true;
+                    RoseStacker.getInstance().getLogger().warning("Failed to copy killer/last damage cause onto simulated stack entities, loot will still be dropped: " + e);
+                }
+            }
 
             int iterations = 1;
             if (isSlime) {
