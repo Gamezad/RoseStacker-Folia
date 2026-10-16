@@ -101,10 +101,17 @@ public final class PersistentDataUtils {
             if (SettingKey.SPAWNER_DISABLE_MOB_AI_OPTIONS_SILENCE.get())
                 entity.setSilent(disable);
 
-            if (SettingKey.SPAWNER_DISABLE_MOB_AI_OPTIONS_NO_KNOCKBACK.get()) {
-                AttributeInstance knockbackAttribute = entity.getAttribute(VersionUtils.KNOCKBACK_RESISTANCE);
-                if (knockbackAttribute != null)
-                    knockbackAttribute.setBaseValue(disable ? Double.MAX_VALUE : 0);
+            AttributeInstance knockbackAttribute = entity.getAttribute(VersionUtils.KNOCKBACK_RESISTANCE);
+            if (knockbackAttribute != null) {
+                if (SettingKey.SPAWNER_DISABLE_MOB_AI_OPTIONS_NO_KNOCKBACK.get()) {
+                    // Restore the mob's own value when AI comes back, not a flat 0 (an iron golem, ravager,
+                    // hoglin, warden etc. have a natural knockback resistance that must not be wiped)
+                    knockbackAttribute.setBaseValue(disable ? Double.MAX_VALUE : knockbackAttribute.getDefaultValue());
+                } else if (knockbackAttribute.getBaseValue() == Double.MAX_VALUE) {
+                    // The option was switched off while the mob already had its knockback disabled by us,
+                    // put the mob's own value back so hits move it again
+                    knockbackAttribute.setBaseValue(knockbackAttribute.getDefaultValue());
+                }
             }
 
             if (SettingKey.SPAWNER_DISABLE_MOB_AI_OPTIONS_DISABLE_ZOMBIFICATION.get()) {
