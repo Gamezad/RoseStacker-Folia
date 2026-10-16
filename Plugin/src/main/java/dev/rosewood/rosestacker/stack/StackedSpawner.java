@@ -49,6 +49,17 @@ public class StackedSpawner extends Stack<SpawnerStackSettings> {
         this.block = spawner;
         this.cachedCreatureSpawner = (CreatureSpawner) this.block.getState();
         this.spawnerTile = NMSAdapter.getHandler().injectStackedSpawnerTile(this);
+
+        if (this.spawnerTile != null) {
+            // The spawner block keeps a copy of its own stack size. The size in the per-chunk data is only
+            // written when RoseStacker saves, so a chunk that is saved or reloaded in between would
+            // otherwise restore a stale or missing size (usually a single spawner) while the spawner keeps
+            // spawning with the spawn count of the old stack size.
+            int storedSize = PersistentDataUtils.getStackedSpawnerSize(this.spawnerTile);
+            if (storedSize > this.size)
+                this.size = storedSize;
+        }
+
         this.stackSettings = RoseStacker.getInstance().getManager(StackSettingManager.class).getSpawnerStackSettings(this.spawnerTile.getSpawnerType());
 
         ThreadUtils.runOnPrimary(spawner.getLocation(), () -> this.updateSpawnerProperties(true));
@@ -202,6 +213,8 @@ public class StackedSpawner extends Stack<SpawnerStackSettings> {
 
         // Handle the entity type changing
         SpawnerType spawnerType = this.spawnerTile.getSpawnerType();
+        PersistentDataUtils.setStackedSpawnerSize(this.spawnerTile, this.size);
+
         this.stackSettings = RoseStacker.getInstance().getManager(StackSettingManager.class).getSpawnerStackSettings(spawnerType);
         if (this.stackSettings == null)
             return;

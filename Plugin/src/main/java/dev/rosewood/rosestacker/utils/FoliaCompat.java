@@ -61,6 +61,9 @@ public final class FoliaCompat {
         if (!FOLIA || entity == null)
             return true;
 
+        if (!regionsTicking)
+            return true; // Startup is single threaded until the region threads start ticking
+
         return RoseStacker.getInstance().getScheduler().isEntityThread(entity);
     }
 
@@ -74,6 +77,9 @@ public final class FoliaCompat {
     public static boolean canUseLocation(Location location) {
         if (!FOLIA || location == null || location.getWorld() == null)
             return true;
+
+        if (!regionsTicking)
+            return true; // Startup is single threaded until the region threads start ticking
 
         return RoseStacker.getInstance().getScheduler().isLocationThread(location);
     }

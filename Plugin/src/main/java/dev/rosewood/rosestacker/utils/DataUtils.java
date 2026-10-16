@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 import org.bukkit.Chunk;
@@ -29,6 +30,7 @@ import org.bukkit.entity.Item;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
+import org.jetbrains.annotations.Nullable;
 
 public final class DataUtils {
 
@@ -173,6 +175,17 @@ public final class DataUtils {
     }
 
     public static List<StackedSpawner> readStackedSpawners(Chunk chunk) {
+        return readStackedSpawners(chunk, null);
+    }
+
+    /**
+     * Reads the spawner stacks stored on a chunk.
+     *
+     * @param chunk  the chunk to read the spawner stacks from
+     * @param filter only blocks matching this filter are restored, null to restore all of them
+     * @return the restored spawner stacks
+     */
+    public static List<StackedSpawner> readStackedSpawners(Chunk chunk, @Nullable Predicate<Block> filter) {
         PersistentDataContainer pdc = chunk.getPersistentDataContainer();
 
         List<StackedSpawner> stackedSpawners = new ArrayList<>();
@@ -193,45 +206,70 @@ public final class DataUtils {
                     int z = dataInput.readInt();
                     boolean placedByPlayer = dataInput.readBoolean();
                     Block block = chunk.getBlock(x, y, z);
-                    if (block.getType() == Material.SPAWNER)
+                    if (block.getType() != Material.SPAWNER)
+                        continue;
+                    if (filter != null && !filter.test(block))
+                        continue;
+
+                    try {
                         stackedSpawners.add(new StackedSpawner(stackSize, block, placedByPlayer, false));
+                    } catch (Exception e) {
+                        // A single spawner that fails to restore must not throw away the rest of the chunk
+                        RoseStacker.getInstance().getLogger().warning("Failed to restore a spawner stack at "
+                                + block.getLocation() + ", it will fall back to a single spawner: " + e);
+                    }
                 }
             }
         } catch (Exception e) {
-            e.printStackTrace();
-            pdc.remove(CHUNK_SPAWNERS_KEY);
+            // Keep the data: deleting it would permanently turn every spawner in this chunk into a single
+            // spawner while they keep spawning with the spawn count of their old stacks
+            RoseStacker.getInstance().getLogger().warning("Failed to read the stored spawner stacks of chunk "
+                    + chunk.getX() + ", " + chunk.getZ() + ", the data was kept: " + e);
         }
 
         return stackedSpawners;
     }
 
-    public static void writeStackedSpawners(Collection<StackedSpawner> stackedSpawners, Chunk chunk) {
-        PersistentDataContainer pdc = chunk.getPersistentDataContainer();
-        byte[] data = null;
+    /**
+     * Writes the given spawner stacks to the chunk they belong to.
+     *
+     * @param stackedSpawners the spawner stacks to store
+     * @param chunk           the chunk to store them in
+     * @return true if the data was stored, false if storing it failed
+     */
+    public static boolean writeStackedSpawners(Collection<StackedSpawner> stackedSpawners, Chunk chunk) {
+        try {
+            PersistentDataContainer pdc = chunk.getPersistentDataContainer();
 
-        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-             ObjectOutputStream dataOutput = new ObjectOutputStream(outputStream)) {
+            byte[] data;
+            try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                 ObjectOutputStream dataOutput = new ObjectOutputStream(outputStream)) {
 
-            dataOutput.writeInt(SPAWNER_DATA_VERSION);
-            dataOutput.writeInt(stackedSpawners.size());
+                dataOutput.writeInt(SPAWNER_DATA_VERSION);
+                dataOutput.writeInt(stackedSpawners.size());
 
-            for (StackedSpawner stackedSpawner : stackedSpawners) {
-                dataOutput.writeInt(stackedSpawner.getStackSize());
-                dataOutput.writeInt(stackedSpawner.getLocation().getBlockX() & 0xF);
-                dataOutput.writeInt(stackedSpawner.getLocation().getBlockY());
-                dataOutput.writeInt(stackedSpawner.getLocation().getBlockZ() & 0xF);
-                dataOutput.writeBoolean(stackedSpawner.isPlacedByPlayer());
+                for (StackedSpawner stackedSpawner : stackedSpawners) {
+                    dataOutput.writeInt(stackedSpawner.getStackSize());
+                    dataOutput.writeInt(stackedSpawner.getLocation().getBlockX() & 0xF);
+                    dataOutput.writeInt(stackedSpawner.getLocation().getBlockY());
+                    dataOutput.writeInt(stackedSpawner.getLocation().getBlockZ() & 0xF);
+                    dataOutput.writeBoolean(stackedSpawner.isPlacedByPlayer());
+                }
+
+                // Serialize that array
+                dataOutput.close();
+                data = outputStream.toByteArray();
             }
 
-            // Serialize that array
-            dataOutput.close();
-            data = outputStream.toByteArray();
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-
-        if (data != null)
             pdc.set(CHUNK_SPAWNERS_KEY, PersistentDataType.BYTE_ARRAY, data);
+            return true;
+        } catch (Exception e) {
+            // The caller needs to know: losing this data turns every spawner stack in the chunk back into
+            // a single spawner while the spawners keep spawning with the spawn count of their old stacks
+            RoseStacker.getInstance().getLogger().warning("Failed to store the spawner stacks of chunk "
+                    + chunk.getX() + ", " + chunk.getZ() + ", it will be retried on the next save: " + e);
+            return false;
+        }
     }
 
     public static List<StackedBlock> readStackedBlocks(Chunk chunk) {
@@ -254,43 +292,55 @@ public final class DataUtils {
                     int y = dataInput.readInt();
                     int z = dataInput.readInt();
 
-                    stackedBlocks.add(new StackedBlock(stackSize, chunk.getBlock(x, y, z), false));
+                    try {
+                        stackedBlocks.add(new StackedBlock(stackSize, chunk.getBlock(x, y, z), false));
+                    } catch (Exception e) {
+                        // A single block that fails to restore must not throw away the rest of the chunk
+                        RoseStacker.getInstance().getLogger().warning("Failed to restore a stacked block in chunk "
+                                + chunk.getX() + ", " + chunk.getZ() + ": " + e);
+                    }
                 }
             }
         } catch (Exception e) {
-            e.printStackTrace();
-            pdc.remove(CHUNK_BLOCKS_KEY);
+            // Keep the data: deleting it would permanently turn every stacked block in this chunk into a
+            // single block
+            RoseStacker.getInstance().getLogger().warning("Failed to read the stored stacked blocks of chunk "
+                    + chunk.getX() + ", " + chunk.getZ() + ", the data was kept: " + e);
         }
 
         return stackedBlocks;
     }
 
-    public static void writeStackedBlocks(Collection<StackedBlock> stackedBlocks, Chunk chunk) {
-        PersistentDataContainer pdc = chunk.getPersistentDataContainer();
-        byte[] data = null;
+    public static boolean writeStackedBlocks(Collection<StackedBlock> stackedBlocks, Chunk chunk) {
+        try {
+            PersistentDataContainer pdc = chunk.getPersistentDataContainer();
 
-        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-             ObjectOutputStream dataOutput = new ObjectOutputStream(outputStream)) {
+            byte[] data;
+            try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                 ObjectOutputStream dataOutput = new ObjectOutputStream(outputStream)) {
 
-            dataOutput.writeInt(BLOCK_DATA_VERSION);
-            dataOutput.writeInt(stackedBlocks.size());
+                dataOutput.writeInt(BLOCK_DATA_VERSION);
+                dataOutput.writeInt(stackedBlocks.size());
 
-            for (StackedBlock stackedBlock : stackedBlocks) {
-                dataOutput.writeInt(stackedBlock.getStackSize());
-                dataOutput.writeInt(stackedBlock.getLocation().getBlockX() & 0xF);
-                dataOutput.writeInt(stackedBlock.getLocation().getBlockY());
-                dataOutput.writeInt(stackedBlock.getLocation().getBlockZ() & 0xF);
+                for (StackedBlock stackedBlock : stackedBlocks) {
+                    dataOutput.writeInt(stackedBlock.getStackSize());
+                    dataOutput.writeInt(stackedBlock.getLocation().getBlockX() & 0xF);
+                    dataOutput.writeInt(stackedBlock.getLocation().getBlockY());
+                    dataOutput.writeInt(stackedBlock.getLocation().getBlockZ() & 0xF);
+                }
+
+                // Serialize that array
+                dataOutput.close();
+                data = outputStream.toByteArray();
             }
 
-            // Serialize that array
-            dataOutput.close();
-            data = outputStream.toByteArray();
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-
-        if (data != null)
             pdc.set(CHUNK_BLOCKS_KEY, PersistentDataType.BYTE_ARRAY, data);
+            return true;
+        } catch (Exception e) {
+            RoseStacker.getInstance().getLogger().warning("Failed to store the stacked blocks of chunk "
+                    + chunk.getX() + ", " + chunk.getZ() + ", it will be retried on the next save: " + e);
+            return false;
+        }
     }
 
 }

@@ -7,6 +7,7 @@ import dev.rosewood.rosegarden.RosePlugin;
 import dev.rosewood.rosegarden.compatibility.CompatibilityAdapter;
 import dev.rosewood.rosegarden.config.CommentedFileConfiguration;
 import dev.rosewood.rosegarden.manager.Manager;
+import dev.rosewood.rosestacker.config.SettingKey;
 import dev.rosewood.rosestacker.nms.NMSAdapter;
 import dev.rosewood.rosestacker.nms.spawner.SpawnerType;
 import dev.rosewood.rosestacker.stack.settings.BlockStackSettings;
@@ -121,6 +122,24 @@ public class StackSettingManager extends Manager {
 
             if (!invalidKeys.isEmpty())
                 this.rosePlugin.getLogger().info("Ignored loading stack settings for unknown entities: " + invalidKeys);
+
+            if (SettingKey.ENTITY_DISABLE_ALL_MOB_AI.get()) {
+                // A per-entity 'disable-all-mob-ai: false' in entity_settings.yml overrides the global setting
+                // and silently leaves those mobs with their AI, which looks like the global setting not working
+                List<String> overridden = this.entitySettings.entrySet().stream()
+                        .filter(x -> !x.getValue().isMobAIDisabled())
+                        .map(x -> x.getKey().name())
+                        .sorted()
+                        .collect(Collectors.toList());
+                if (!overridden.isEmpty()) {
+                    String listed = overridden.size() > 15
+                            ? String.join(", ", overridden.subList(0, 15)) + " and " + (overridden.size() - 15) + " more"
+                            : String.join(", ", overridden);
+                    this.rosePlugin.getLogger().warning("global-entity-settings.disable-all-mob-ai is true, but "
+                            + listed + " have 'disable-all-mob-ai: false' set in entity_settings.yml and keep their AI. "
+                            + "Set those to 'default' to use the global setting instead.");
+                }
+            }
         } catch (Exception e) {
             e.printStackTrace();
         }

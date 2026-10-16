@@ -57,6 +57,7 @@ import org.bukkit.Material;
 import org.bukkit.Particle.DustOptions;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockState;
 import org.bukkit.block.CreatureSpawner;
 import org.bukkit.entity.ArmorStand;
 import org.bukkit.entity.Entity;
@@ -1398,10 +1399,33 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         if (!chunk.isLoaded())
             return;
 
+        // Stacks that are still tracked in memory are always at least as up to date as the stored data
+        StackChunkData existingData = this.stackChunkData.get(chunk);
+
         Map<Block, StackedSpawner> stackedSpawners = new ConcurrentHashMap<>();
-        if (this.stackManager.isSpawnerStackingEnabled())
-            for (StackedSpawner stackedSpawner : DataUtils.readStackedSpawners(chunk))
+        if (this.stackManager.isSpawnerStackingEnabled()) {
+            if (existingData != null)
+                stackedSpawners.putAll(existingData.getSpawners());
+
+            for (StackedSpawner stackedSpawner : DataUtils.readStackedSpawners(chunk, stackedSpawners::containsKey))
                 stackedSpawners.put(stackedSpawner.getBlock(), stackedSpawner);
+
+            // Spawners without any stored stack data would otherwise stay untracked forever: they keep
+            // spawning with the spawn count their old stack left behind while the plugin sees a single
+            // spawner, so their displayed amount and the amount they drop no longer match what they spawn
+            for (BlockState blockState : chunk.getTileEntities()) {
+                if (!(blockState instanceof CreatureSpawner))
+                    continue;
+
+                Block block = blockState.getBlock();
+                if (stackedSpawners.containsKey(block))
+                    continue;
+
+                StackedSpawner restoredSpawner = this.createMissingSpawnerStack(block);
+                if (restoredSpawner != null)
+                    stackedSpawners.put(block, restoredSpawner);
+            }
+        }
 
         Map<Block, StackedBlock> stackedBlocks = new ConcurrentHashMap<>();
         if (this.stackManager.isBlockStackingEnabled())
@@ -1410,11 +1434,38 @@ public class StackingThread implements StackingLogic, AutoCloseable {
 
         if (!stackedSpawners.isEmpty() || !stackedBlocks.isEmpty()) {
             this.stackChunkData.put(chunk, new StackChunkData(stackedSpawners, stackedBlocks));
-            ThreadUtils.runAsync(() -> {
-                stackedSpawners.values().forEach(StackedSpawner::updateDisplay);
-                stackedBlocks.values().forEach(StackedBlock::updateDisplay);
-            });
+
+            // During startup the region threads aren't ticking yet and the displays are created by the
+            // hologram task once they are, scheduling them now would only add work to the first tick
+            if (!FoliaCompat.isFolia() || FoliaCompat.isRegionsTicking()) {
+                ThreadUtils.runAsync(() -> {
+                    stackedSpawners.values().forEach(StackedSpawner::updateDisplay);
+                    stackedBlocks.values().forEach(StackedBlock::updateDisplay);
+                });
+            }
         }
+    }
+
+    /**
+     * Creates a spawner stack for a spawner block that has no stack data at all. Unlike
+     * {@link #createSpawnerStack(Block, int, boolean)} this never hands the work to another region: it is
+     * only called from {@link #loadChunkBlocks(Chunk)}, which already runs on the thread that owns the
+     * chunk (chunk load events and the startup scan) and already touches the chunk's block entities.
+     *
+     * @param block the spawner block to create a stack for
+     * @return the created stack, or null if the block can't hold a stack
+     */
+    private StackedSpawner createMissingSpawnerStack(Block block) {
+        if (block.getType() != Material.SPAWNER)
+            return null;
+
+        CreatureSpawner creatureSpawner = (CreatureSpawner) block.getState();
+        EntityType spawnedType = CompatibilityAdapter.getCreatureSpawnerHandler().getSpawnedType(creatureSpawner);
+        if (!this.stackManager.isSpawnerStackingEnabled() || !this.stackManager.isSpawnerTypeStackable(spawnedType))
+            return null;
+
+        // The stack restores its own size from the spawner block, the caller re-creates the displays
+        return new StackedSpawner(1, block, false, false);
     }
 
     @Override
@@ -1469,6 +1520,8 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         if (stackChunkData == null)
             return;
 
+        boolean storedEverything = true;
+
         if (this.stackManager.isSpawnerStackingEnabled()) {
             if (clearStored) {
                 stackChunkData.getSpawners().values().forEach(stack -> {
@@ -1476,7 +1529,8 @@ public class StackingThread implements StackingLogic, AutoCloseable {
                     stack.kickOutGuiViewers();
                 });
             }
-            DataUtils.writeStackedSpawners(stackChunkData.getSpawners().values(), chunk);
+            if (!DataUtils.writeStackedSpawners(stackChunkData.getSpawners().values(), chunk))
+                storedEverything = false;
         }
 
         if (this.stackManager.isBlockStackingEnabled()) {
@@ -1486,10 +1540,13 @@ public class StackingThread implements StackingLogic, AutoCloseable {
                     stack.kickOutGuiViewers();
                 });
             }
-            DataUtils.writeStackedBlocks(stackChunkData.getBlocks().values(), chunk);
+            if (!DataUtils.writeStackedBlocks(stackChunkData.getBlocks().values(), chunk))
+                storedEverything = false;
         }
 
-        if (clearStored)
+        // Only forget the stacks if they were actually stored, otherwise they would come back as single
+        // spawners (or not at all) while the spawners keep spawning with the spawn count of their old stacks
+        if (clearStored && storedEverything)
             this.stackChunkData.remove(chunk);
     }
 

@@ -195,7 +195,9 @@ public class EntityListener implements Listener {
         }
 
         if (EntityUtils.hasSpawnerSpawnReason(entity)) {
-            if (PersistentDataUtils.isSpawnedFromSpawner(entity))
+            // Only skip when RoseStacker already tagged this mob, checking isSpawnedFromSpawner here would
+            // always be true because it also accepts the spawn reason we just matched on
+            if (PersistentDataUtils.isTaggedSpawnedFromSpawner(entity))
                 return;
 
             // If we haven't already handled this mob as being from a spawner, handle it now

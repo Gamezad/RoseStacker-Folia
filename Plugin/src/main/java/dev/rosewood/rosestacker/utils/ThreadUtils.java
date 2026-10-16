@@ -33,6 +33,13 @@ public final class ThreadUtils {
      * @param runnable the task to run
      */
     public static void runOnPrimary(Entity entity, Runnable runnable) {
+        if (isStartupPhase()) {
+            // Startup is still single threaded, the region threads won't tick until they start, so run the
+            // task right away like on Paper instead of handing it to a scheduler that can't run it yet
+            runnable.run();
+            return;
+        }
+
         if (!checkEnabled())
             return;
 
@@ -56,6 +63,13 @@ public final class ThreadUtils {
      * @param runnable the task to run
      */
     public static void runOnPrimary(Location location, Runnable runnable) {
+        if (isStartupPhase()) {
+            // Startup is still single threaded, the region threads won't tick until they start, so run the
+            // task right away like on Paper instead of handing it to a scheduler that can't run it yet
+            runnable.run();
+            return;
+        }
+
         if (!checkEnabled())
             return;
 
@@ -68,6 +82,14 @@ public final class ThreadUtils {
         } else {
             runOnPrimary(runnable);
         }
+    }
+
+    /**
+     * @return true if Folia regions have not started ticking yet, meaning the server is still running
+     *         single threaded and world state may be touched directly
+     */
+    private static boolean isStartupPhase() {
+        return FoliaCompat.isFolia() && !FoliaCompat.isRegionsTicking();
     }
 
     public static void runOffPrimary(Runnable runnable) {
