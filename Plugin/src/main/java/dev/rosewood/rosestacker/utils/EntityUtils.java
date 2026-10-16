@@ -201,11 +201,19 @@ public final class EntityUtils {
         int minZ = floorCoordinate(bounds.getMinZ());
         int maxZ = floorCoordinate(bounds.getMaxZ());
 
+        // Folia: reading block state is only legal for blocks owned by the current region. Region ownership
+        // is chunk based, so the entity's own chunk is checked once and every block inside of it is assumed
+        // to be readable while blocks in other chunks are checked individually.
+        int centerChunkX = location.getBlockX() >> 4;
+        int centerChunkZ = location.getBlockZ() >> 4;
+        boolean centerReadable = FoliaCompat.canUseLocation(location);
+
         for (int x = minX; x <= maxX; x++) {
             for (int y = minY; y <= maxY; y++) {
                 for (int z = minZ; z <= maxZ; z++) {
                     Location blockLocation = new Location(world, x, y, z);
-                    intersectingBlocks.put(blockLocation, getLazyBlockMaterial(blockLocation));
+                    boolean knownReadable = centerReadable && (x >> 4) == centerChunkX && (z >> 4) == centerChunkZ;
+                    intersectingBlocks.put(blockLocation, getLazyBlockMaterial(blockLocation, knownReadable));
                 }
             }
         }
@@ -214,9 +222,16 @@ public final class EntityUtils {
     }
 
     public static Material getLazyBlockMaterial(Location location) {
+        return getLazyBlockMaterial(location, false);
+    }
+
+    private static Material getLazyBlockMaterial(Location location, boolean knownReadable) {
         World world = location.getWorld();
         if (world == null || location.getBlockY() < world.getMinHeight() || location.getBlockY() >= world.getMaxHeight())
             return Material.AIR;
+
+        if (!knownReadable && !FoliaCompat.canUseLocation(location))
+            return Material.AIR; // Folia: another region owns this block, reading it from here is not allowed
 
         // TODO: Account for the maximum size of slimes and magma cubes
 
@@ -251,25 +266,53 @@ public final class EntityUtils {
         if (boundingBox == null) {
             if (entityType == EntityType.ENDER_DRAGON) {
                 boundingBox = new BoundingBox(-4, 0, -4, 4, 8, 4);
+                cachedBoundingBoxes.put(entityType, boundingBox);
             } else {
-                LivingEntity entity = null;
-                try {
-                    entity = NMSAdapter.getHandler().createNewEntityUnspawned(entityType, new Location(location.getWorld(), 0, 0, 0), CreatureSpawnEvent.SpawnReason.CUSTOM);
-                } catch (Exception ignored) { }
-
-                if (entity != null) {
-                    boundingBox = entity.getBoundingBox();
+                boundingBox = measureBoundingBox(entityType, location);
+                if (boundingBox != null) // A failed measurement is retried later instead of being cached
                     cachedBoundingBoxes.put(entityType, boundingBox);
-                } else {
-                    // This should never happen unless the entity type is not a LivingEntity
-                    boundingBox = new BoundingBox();
-                }
             }
         }
 
-        boundingBox = boundingBox.clone();
-        boundingBox.shift(location.clone().subtract(0.5, 0, 0.5));
-        return boundingBox;
+        if (boundingBox == null) // This should never happen unless the entity type is not a LivingEntity
+            boundingBox = new BoundingBox();
+
+        return shiftBox(boundingBox, location.getX() - 0.5, location.getY(), location.getZ() - 0.5);
+    }
+
+    /**
+     * Measures the bounding box of an entity type by creating a throwaway entity of that type, then re-bases
+     * the result onto block (0, 0, 0) so it can be cached per entity type and shifted to any location later.
+     * <p>
+     * The throwaway entity is created at the location being measured for rather than a fixed location because
+     * Folia only allows a region to read the state of entities that region owns. Creating it somewhere else
+     * turned every measurement into a cross-region access, which threw and canceled the surrounding spawn.
+     *
+     * @param entityType The entity type to measure
+     * @param location The location being measured for, which the current thread has to be able to use
+     * @return The measured bounding box in block (0, 0, 0) space, or null if it could not be measured
+     */
+    private static BoundingBox measureBoundingBox(EntityType entityType, Location location) {
+        if (!FoliaCompat.canUseLocation(location))
+            return null; // Folia: the entity would belong to another region, reading its state here would fail
+
+        Location measurementLocation = new Location(location.getWorld(), location.getBlockX(), location.getBlockY(), location.getBlockZ());
+        try {
+            LivingEntity entity = NMSAdapter.getHandler().createNewEntityUnspawned(entityType, measurementLocation, CreatureSpawnEvent.SpawnReason.CUSTOM);
+            if (entity == null)
+                return null;
+
+            return shiftBox(entity.getBoundingBox(), -measurementLocation.getBlockX(), -measurementLocation.getBlockY(), -measurementLocation.getBlockZ());
+        } catch (Exception ignored) { // Also catches Folia's region access checks
+            return null;
+        }
+    }
+
+    private static BoundingBox shiftBox(BoundingBox boundingBox, double x, double y, double z) {
+        return new BoundingBox(
+                boundingBox.getMinX() + x, boundingBox.getMinY() + y, boundingBox.getMinZ() + z,
+                boundingBox.getMaxX() + x, boundingBox.getMaxY() + y, boundingBox.getMaxZ() + z
+        );
     }
 
     private static int floorCoordinate(double value) {
