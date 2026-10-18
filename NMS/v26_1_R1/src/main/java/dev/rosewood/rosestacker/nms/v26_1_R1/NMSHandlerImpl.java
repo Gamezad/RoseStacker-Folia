@@ -45,7 +45,6 @@ import net.minecraft.util.Mth;
 import net.minecraft.util.ProblemReporter;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.EntityReference;
 import net.minecraft.world.entity.EntitySpawnReason;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.NeutralMob;
@@ -380,12 +379,6 @@ public class NMSHandlerImpl implements NMSHandler {
         CompoundTag tagCompound = nmsItem.getOrDefault(DataComponents.CUSTOM_DATA, CustomData.EMPTY).copyTag();
         CompoundTag targetCompound = tagCompound.getCompoundOrEmpty(compoundKey);
         return targetCompound.getStringOr(valueKey, "");
-    }
-
-    @Override
-    public void setLastHurtBy(LivingEntity livingEntity, Player player) {
-        if (player != null)
-            ((CraftLivingEntity) livingEntity).getHandle().lastHurtByPlayer = EntityReference.of(((CraftPlayer) player).getHandle());
     }
 
     @Override

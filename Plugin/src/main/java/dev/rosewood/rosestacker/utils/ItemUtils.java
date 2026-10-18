@@ -17,6 +17,8 @@ import dev.rosewood.rosestacker.nms.spawner.SpawnerType;
 import dev.rosewood.rosestacker.stack.settings.BlockStackSettings;
 import dev.rosewood.rosestacker.stack.settings.EntityStackSettings;
 import dev.rosewood.rosestacker.stack.settings.SpawnerStackSettings;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
+import dev.rosewood.rosestacker.utils.ThreadUtils;
 import java.lang.reflect.Field;
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -89,6 +91,12 @@ public final class ItemUtils {
      * @param itemStacks The ItemStacks to give
      */
     public static void dropItemsToPlayer(Player player, Collection<ItemStack> itemStacks) {
+        if (!FoliaCompat.canUseEntity(player)) {
+            // Folia: inventory contents and the player position may only be touched by the owning region
+            ThreadUtils.runSync(player, () -> dropItemsToPlayer(player, itemStacks));
+            return;
+        }
+
         List<ItemStack> extraItems = new ArrayList<>();
         for (ItemStack itemStack : itemStacks)
             extraItems.addAll(player.getInventory().addItem(itemStack).values());

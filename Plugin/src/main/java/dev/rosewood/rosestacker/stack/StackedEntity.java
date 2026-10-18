@@ -26,6 +26,7 @@ import dev.rosewood.rosestacker.stack.settings.EntityStackSettings;
 import dev.rosewood.rosestacker.stack.settings.MultikillBound;
 import dev.rosewood.rosestacker.utils.DataUtils;
 import dev.rosewood.rosestacker.utils.EntityUtils;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import dev.rosewood.rosestacker.utils.ItemUtils;
 import dev.rosewood.rosestacker.utils.PersistentDataUtils;
 import dev.rosewood.rosestacker.utils.StackerUtils;
@@ -64,6 +65,8 @@ import org.jetbrains.annotations.Nullable;
 
 
 public class StackedEntity extends Stack<EntityStackSettings> implements Comparable<StackedEntity> {
+
+    private static boolean killerPropagationErrorLogged;
 
     private LivingEntity entity;
     private StackedEntityDataStorage stackedEntityDataStorage;
@@ -119,6 +122,12 @@ public class StackedEntity extends Stack<EntityStackSettings> implements Compara
         if (entity == null || entity == this.entity)
             return;
 
+        if (!FoliaCompat.canUseEntity(entity)) {
+            // Folia: the new entity may live in another region, re-run this on its owning region
+            ThreadUtils.runSync(entity, this::updateEntity);
+            return;
+        }
+
         this.entity = entity;
         this.stackedEntityDataStorage.updateEntity(entity);
         this.resetHasMoved();
@@ -139,8 +148,9 @@ public class StackedEntity extends Stack<EntityStackSettings> implements Compara
         // EnderDragonChangePhaseEvents is called when reading the entity NBT data.
         // Since we usually do this async and the event isn't allowed to be async, Spigot throws a fit.
         // We switch over to a non-async thread specifically for ender dragons because of this.
-        if (!Bukkit.isPrimaryThread() && entity instanceof EnderDragon) {
-            ThreadUtils.runSync(task);
+        // On Folia the reading region also has to own the dragon, otherwise we hop to it as well.
+        if (entity instanceof EnderDragon && (!Bukkit.isPrimaryThread() || !FoliaCompat.canUseEntity(entity))) {
+            ThreadUtils.runSync(entity, task);
         } else {
             task.run();
         }
@@ -287,6 +297,13 @@ public class StackedEntity extends Stack<EntityStackSettings> implements Compara
     }
 
     private void calculateAndDropPartialStackLoot(Supplier<EntityDrops> calculator) {
+        // Folia: death processing must run on the region owning the entity, the loot calculation reads
+        // world state (loot tables, block positions) and can never hop onto an async thread there
+        if (NMSUtil.isFolia() && !FoliaCompat.canUseEntity(this.entity)) {
+            ThreadUtils.runSync(this.entity, () -> this.calculateAndDropPartialStackLoot(calculator));
+            return;
+        }
+
         // The stack loot can either be processed synchronously or asynchronously depending on a setting
         // It should always be processed async unless errors are caused by other plugins
         Player killer = this.entity.getKiller();
@@ -309,7 +326,10 @@ public class StackedEntity extends Stack<EntityStackSettings> implements Compara
             }
         };
 
-        if (async && Bukkit.isPrimaryThread()) {
+        if (NMSUtil.isFolia()) {
+            // Stay on the owning region; finishTask runs inline because region threads are primary threads
+            mainTask.run();
+        } else if (async && Bukkit.isPrimaryThread()) {
             ThreadUtils.runAsync(mainTask);
         } else if (!async && !Bukkit.isPrimaryThread()) {
             ThreadUtils.runSync(mainTask);
@@ -451,12 +471,22 @@ public class StackedEntity extends Stack<EntityStackSettings> implements Compara
 
         NMSHandler nmsHandler = NMSAdapter.getHandler();
         for (LivingEntity entity : stackEntities) {
-            // Propagate fire ticks and last damage cause
-            entity.setFireTicks(mainEntity.getFireTicks());
-            if (fromSpawner)
-                SpawnerFlagPersistenceHook.flagSpawnerSpawned(entity);
-            nmsHandler.setLastHurtBy(entity, killer);
-            entity.setLastDamageCause(propagateKiller ? mainEntity.getLastDamageCause() : null);
+            // These are cosmetic copies onto simulated entities. A failure here (for example a server build
+            // that is missing an NMS method this plugin was compiled against) must never abort the rest of
+            // the loot calculation, otherwise the whole stack drops nothing.
+            try {
+                // Propagate fire ticks and last damage cause
+                entity.setFireTicks(mainEntity.getFireTicks());
+                if (fromSpawner)
+                    SpawnerFlagPersistenceHook.flagSpawnerSpawned(entity);
+                nmsHandler.setLastHurtBy(entity, killer);
+                entity.setLastDamageCause(propagateKiller ? mainEntity.getLastDamageCause() : null);
+            } catch (Exception | LinkageError e) {
+                if (!killerPropagationErrorLogged) {
+                    killerPropagationErrorLogged = true;
+                    RoseStacker.getInstance().getLogger().warning("Failed to copy killer/last damage cause onto simulated stack entities, loot will still be dropped: " + e);
+                }
+            }
 
             int iterations = 1;
             if (isSlime) {
@@ -632,6 +662,15 @@ public class StackedEntity extends Stack<EntityStackSettings> implements Compara
 
     @Override
     public void updateDisplay() {
+        if (this.entity == null)
+            return;
+
+        if (!FoliaCompat.canUseEntity(this.entity)) {
+            // Folia: nametag packets are built from entity state, run on the owning region
+            ThreadUtils.runSync(this.entity, this::updateDisplay);
+            return;
+        }
+
         this.displayName = null;
         String displayName = this.getDisplayName();
         NMSHandler nmsHandler = NMSAdapter.getHandler();

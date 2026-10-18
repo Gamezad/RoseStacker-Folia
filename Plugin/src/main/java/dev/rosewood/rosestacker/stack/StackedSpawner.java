@@ -13,6 +13,7 @@ import dev.rosewood.rosestacker.nms.spawner.SpawnerType;
 import dev.rosewood.rosestacker.nms.spawner.StackedSpawnerTile;
 import dev.rosewood.rosestacker.stack.settings.SpawnerStackSettings;
 import dev.rosewood.rosestacker.stack.settings.conditions.spawner.ConditionTag;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import dev.rosewood.rosestacker.utils.PersistentDataUtils;
 import dev.rosewood.rosestacker.utils.StackerUtils;
 import dev.rosewood.rosestacker.utils.ThreadUtils;
@@ -48,9 +49,20 @@ public class StackedSpawner extends Stack<SpawnerStackSettings> {
         this.block = spawner;
         this.cachedCreatureSpawner = (CreatureSpawner) this.block.getState();
         this.spawnerTile = NMSAdapter.getHandler().injectStackedSpawnerTile(this);
+
+        if (this.spawnerTile != null) {
+            // The spawner block keeps a copy of its own stack size. The size in the per-chunk data is only
+            // written when RoseStacker saves, so a chunk that is saved or reloaded in between would
+            // otherwise restore a stale or missing size (usually a single spawner) while the spawner keeps
+            // spawning with the spawn count of the old stack size.
+            int storedSize = PersistentDataUtils.getStackedSpawnerSize(this.spawnerTile);
+            if (storedSize > this.size)
+                this.size = storedSize;
+        }
+
         this.stackSettings = RoseStacker.getInstance().getManager(StackSettingManager.class).getSpawnerStackSettings(this.spawnerTile.getSpawnerType());
 
-        ThreadUtils.runOnPrimary(() -> this.updateSpawnerProperties(true));
+        ThreadUtils.runOnPrimary(spawner.getLocation(), () -> this.updateSpawnerProperties(true));
         if (updateDisplay)
             this.updateDisplay();
     }
@@ -139,6 +151,13 @@ public class StackedSpawner extends Stack<SpawnerStackSettings> {
         if (!SettingKey.SPAWNER_DISPLAY_TAGS.get() || this.stackSettings == null)
             return;
 
+        if (!FoliaCompat.canUseBlock(this.block)) {
+            // Folia: spawner state and the hologram armor stand live in the block's region
+            if (this.block != null)
+                ThreadUtils.runSync(this.block.getLocation(), this::updateDisplay);
+            return;
+        }
+
         HologramManager hologramManager = RoseStacker.getInstance().getManager(HologramManager.class);
         LocaleManager localeManager = RoseStacker.getInstance().getManager(LocaleManager.class);
 
@@ -185,8 +204,17 @@ public class StackedSpawner extends Stack<SpawnerStackSettings> {
     }
 
     public void updateSpawnerProperties(boolean resetDelay) {
+        if (!FoliaCompat.canUseBlock(this.block)) {
+            // Folia: spawner tile state may only be touched by the block's region
+            if (this.block != null)
+                ThreadUtils.runSync(this.block.getLocation(), () -> this.updateSpawnerProperties(resetDelay));
+            return;
+        }
+
         // Handle the entity type changing
         SpawnerType spawnerType = this.spawnerTile.getSpawnerType();
+        PersistentDataUtils.setStackedSpawnerSize(this.spawnerTile, this.size);
+
         this.stackSettings = RoseStacker.getInstance().getManager(StackSettingManager.class).getSpawnerStackSettings(spawnerType);
         if (this.stackSettings == null)
             return;

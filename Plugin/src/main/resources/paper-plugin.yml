@@ -4,6 +4,7 @@ authors: [Esophose]
 website: https://www.spigotmc.org/resources/82729/
 main: dev.rosewood.rosestacker.RoseStacker
 api-version: '1.19'
+folia-supported: true
 dependencies:
   - name: Boss
     required: false

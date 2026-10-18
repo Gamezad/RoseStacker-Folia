@@ -30,6 +30,7 @@ import java.util.Objects;
 import org.bukkit.Bukkit;
 import org.bukkit.Material;
 import org.bukkit.Sound;
+import org.bukkit.block.Block;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemFlag;
 import org.bukkit.inventory.ItemStack;
@@ -233,7 +234,8 @@ public class StackedBlockGui {
             BlockUnstackEvent blockUnstackEvent = new BlockUnstackEvent(player, this.stackedBlock, -difference);
             Bukkit.getPluginManager().callEvent(blockUnstackEvent);
             if (blockUnstackEvent.isCancelled()) {
-                this.takeFromPlayer(player, -difference);
+                // Inventory changes must run on the player's region (Folia)
+                ThreadUtils.runOnPrimary(player, () -> this.takeFromPlayer(player, -difference));
                 return;
             }
 
@@ -245,14 +247,19 @@ public class StackedBlockGui {
         if (newStackSize < 0)
             newStackSize = 0;
 
-        this.stackedBlock.setStackSize(newStackSize);
+        // Block mutations must run on the region that owns the block (Folia)
+        final int finalNewStackSize = newStackSize;
+        Block block = this.stackedBlock.getBlock();
+        ThreadUtils.runOnPrimary(block.getLocation(), () -> {
+            this.stackedBlock.setStackSize(finalNewStackSize);
 
-        if (newStackSize == 1) {
-            stackManager.removeBlockStack(this.stackedBlock);
-        } else if (newStackSize == 0) {
-            stackManager.removeBlockStack(this.stackedBlock);
-            this.stackedBlock.getBlock().setType(Material.AIR);
-        }
+            if (finalNewStackSize == 1) {
+                stackManager.removeBlockStack(this.stackedBlock);
+            } else if (finalNewStackSize == 0) {
+                stackManager.removeBlockStack(this.stackedBlock);
+                block.setType(Material.AIR);
+            }
+        });
     }
 
     /**
@@ -294,7 +301,7 @@ public class StackedBlockGui {
             return;
 
         StackManager stackManager = this.rosePlugin.getManager(StackManager.class);
-        ThreadUtils.runSync(() -> {
+        ThreadUtils.runSync(this.stackedBlock.getBlock().getLocation(), () -> {
             BlockUnstackEvent blockUnstackEvent = new BlockUnstackEvent(player, this.stackedBlock, this.stackedBlock.getStackSize());
             Bukkit.getPluginManager().callEvent(blockUnstackEvent);
             if (blockUnstackEvent.isCancelled())

@@ -176,11 +176,20 @@ public interface NMSHandler {
 
     /**
      * Sets the LivingEntity's lastHurtByPlayer value to the given Player
+     * <p>
+     * This is implemented through the Bukkit API on purpose. Directly assigning the NMS field requires a
+     * version specific reference (the field type changed to {@code EntityReference} and the way to create
+     * one differs between server builds), which blows up with a NoSuchMethodError when a server ships a
+     * slightly different build than the one this plugin was compiled against. The API method is remapped
+     * by the server itself and always matches what that server actually has.
      *
      * @param livingEntity The LivingEntity
      * @param player The Player
      */
-    void setLastHurtBy(LivingEntity livingEntity, Player player);
+    default void setLastHurtBy(LivingEntity livingEntity, Player player) {
+        if (player != null)
+            livingEntity.setKiller(player);
+    }
 
     /**
      * Checks if a LivingEntity can see a specific Location point

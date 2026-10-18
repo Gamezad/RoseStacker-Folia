@@ -153,7 +153,7 @@ public class EntityListener implements Listener {
 
         // Delay stacking by 1 tick for spawn eggs due to an egg duplication issue
         if (event.getSpawnReason() == CreatureSpawnEvent.SpawnReason.SPAWNER_EGG) {
-            ThreadUtils.runSync(task);
+            ThreadUtils.runSync(entity, task);
         } else {
             task.run();
         }
@@ -195,7 +195,9 @@ public class EntityListener implements Listener {
         }
 
         if (EntityUtils.hasSpawnerSpawnReason(entity)) {
-            if (PersistentDataUtils.isSpawnedFromSpawner(entity))
+            // Only skip when RoseStacker already tagged this mob, checking isSpawnedFromSpawner here would
+            // always be true because it also accepts the spawn reason we just matched on
+            if (PersistentDataUtils.isTaggedSpawnedFromSpawner(entity))
                 return;
 
             // If we haven't already handled this mob as being from a spawner, handle it now
@@ -417,7 +419,7 @@ public class EntityListener implements Listener {
         };
 
         if (SettingKey.ENTITY_KILL_DELAY_NEXT_SPAWN.get()) {
-            ThreadUtils.runSync(task);
+            ThreadUtils.runSync(entity, task);
         } else {
             task.run();
         }
@@ -480,7 +482,7 @@ public class EntityListener implements Listener {
             }
 
             event.getEntity().remove();
-            ThreadUtils.runSync(() -> {
+            ThreadUtils.runSync(transformedEntity, () -> {
                 this.stackManager.setEntityStackingTemporarilyDisabled(true);
                 LivingEntity newEntity = serialized.createEntity(transformedEntity.getLocation(), true, transformedEntity.getType());
                 if (aiDisabled)
@@ -510,9 +512,9 @@ public class EntityListener implements Listener {
                 event.getTransformedEntities().stream().map(x -> (LivingEntity) x).forEach(newStackSettings::applySpawnerSpawnedProperties);
 
             if (event.getTransformReason() == TransformReason.LIGHTNING) { // Wait for lightning to disappear
-                ThreadUtils.runSyncDelayed(stackedEntity::decreaseStackSize, 20);
+                ThreadUtils.runSyncDelayed(stackedEntity.getEntity(), stackedEntity::decreaseStackSize, 20);
             } else {
-                ThreadUtils.runSync(stackedEntity::decreaseStackSize);
+                ThreadUtils.runSync(stackedEntity.getEntity(), stackedEntity::decreaseStackSize);
             }
         }
     }
@@ -629,7 +631,7 @@ public class EntityListener implements Listener {
         }
 
         if (!stackedEntity.getStackSettings().getSettingValue(EntityStackSettings.SHEEP_SHEAR_ALL_SHEEP_IN_STACK).getBoolean()) {
-            ThreadUtils.runSync(() -> {
+            ThreadUtils.runSync(stackedEntity.getEntity(), () -> {
                 if (!stackedEntity.shouldStayStacked())
                     this.stackManager.splitEntityStack(stackedEntity);
             });
@@ -639,6 +641,11 @@ public class EntityListener implements Listener {
         ShearedHandler shearedHandler = CompatibilityAdapter.getShearedHandler();
         List<ItemStack> drops = new ArrayList<>();
         this.stackManager.setEntityUnstackingTemporarilyDisabled(true);
+
+        // Capture the drop location on the owning region before going async
+        Location shearDropLocation = sheepEntity.getLocation();
+        shearDropLocation.add(0, sheepEntity.getEyeHeight(), 0);
+
         ThreadUtils.runAsync(() -> {
             try {
                 stackedEntity.getDataStorage().forEachTransforming(internal -> {
@@ -651,9 +658,7 @@ public class EntityListener implements Listener {
                     return false;
                 });
 
-                Location location = sheepEntity.getLocation();
-                location.add(0, sheepEntity.getEyeHeight(), 0);
-                ThreadUtils.runSync(() -> this.stackManager.preStackItems(drops, location, false));
+                ThreadUtils.runSync(shearDropLocation, () -> this.stackManager.preStackItems(drops, shearDropLocation, false));
             } finally {
                 this.stackManager.setEntityUnstackingTemporarilyDisabled(false);
             }

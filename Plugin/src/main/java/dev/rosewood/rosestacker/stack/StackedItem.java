@@ -8,7 +8,9 @@ import dev.rosewood.rosestacker.manager.LocaleManager;
 import dev.rosewood.rosestacker.manager.StackSettingManager;
 import dev.rosewood.rosestacker.nms.NMSAdapter;
 import dev.rosewood.rosestacker.stack.settings.ItemStackSettings;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import dev.rosewood.rosestacker.utils.StackerUtils;
+import dev.rosewood.rosestacker.utils.ThreadUtils;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Location;
@@ -55,6 +57,12 @@ public class StackedItem extends Stack<ItemStackSettings> implements Comparable<
         if (item == null || item == this.item)
             return;
 
+        if (!FoliaCompat.canUseEntity(item)) {
+            // Folia: the new item may live in another region, re-run this on its owning region
+            ThreadUtils.runSync(item, this::updateItem);
+            return;
+        }
+
         this.item = item;
         this.updateDisplay();
     }
@@ -86,6 +94,15 @@ public class StackedItem extends Stack<ItemStackSettings> implements Comparable<
 
     @Override
     public void updateDisplay() {
+        if (this.item == null)
+            return;
+
+        if (!FoliaCompat.canUseEntity(this.item)) {
+            // Folia: item state may only be touched by the owning region
+            ThreadUtils.runSync(this.item, this::updateDisplay);
+            return;
+        }
+
         ItemStack itemStack = this.item.getItemStack();
         itemStack.setAmount(Math.min(this.size, itemStack.getMaxStackSize()));
 

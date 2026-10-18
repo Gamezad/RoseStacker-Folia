@@ -5,6 +5,7 @@ import com.google.common.cache.CacheBuilder;
 import dev.rosewood.rosegarden.RosePlugin;
 import dev.rosewood.rosegarden.manager.Manager;
 import dev.rosewood.rosegarden.scheduler.task.ScheduledTask;
+import dev.rosewood.rosegarden.utils.NMSUtil;
 import dev.rosewood.rosestacker.config.SettingKey;
 import dev.rosewood.rosestacker.hook.WorldGuardHook;
 import dev.rosewood.rosestacker.nms.spawner.SpawnerType;
@@ -92,7 +93,7 @@ public class StackManager extends Manager implements StackingLogic {
         long autosaveFrequency = SettingKey.AUTOSAVE_FREQUENCY.get();
         if (autosaveFrequency > 0) {
             long interval = autosaveFrequency * 20 * 60;
-            this.autosaveTask = this.rosePlugin.getScheduler().runTaskTimer(() -> this.saveAllData(false), interval, interval);
+            this.autosaveTask = this.rosePlugin.getScheduler().runTaskTimer(() -> this.stackingThreads.values().forEach(StackingThread::autosave), interval, interval);
         }
 
         String multikillAmountValue = SettingKey.ENTITY_MULTIKILL_AMOUNT.get();
@@ -515,6 +516,20 @@ public class StackManager extends Manager implements StackingLogic {
             stackingThread.close();
             this.stackingThreads.remove(worldUUID);
         }
+    }
+
+    /**
+     * Schedules per-chunk maintenance tasks (region-local entity cache refresh and orphan rescans) for
+     * every loaded chunk that does not have one yet. Only used on Folia, and intended to be called while
+     * region ticking has not started yet (plugin startup or {@link dev.rosewood.rosestacker.utils.FoliaCompat#markRegionsTicking()}),
+     * or from a chunk load event on the owning region. Idempotent.
+     */
+    public void backfillChunkMaintenance() {
+        if (!NMSUtil.isFolia())
+            return;
+
+        for (StackingThread stackingThread : this.stackingThreads.values())
+            stackingThread.backfillChunkMaintenance();
     }
 
     /**

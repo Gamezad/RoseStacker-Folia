@@ -23,6 +23,7 @@ import dev.rosewood.rosestacker.stack.settings.conditions.spawner.tags.MaxNearby
 import dev.rosewood.rosestacker.stack.settings.conditions.spawner.tags.NoneConditionTag;
 import dev.rosewood.rosestacker.stack.settings.conditions.spawner.tags.NotPlayerPlacedConditionTag;
 import dev.rosewood.rosestacker.utils.PersistentDataUtils;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import dev.rosewood.rosestacker.utils.StackerUtils;
 import dev.rosewood.rosestacker.utils.ThreadUtils;
 import dev.rosewood.rosestacker.utils.VersionUtils;
@@ -63,6 +64,13 @@ public class MobSpawningMethod implements SpawningMethod {
 
     @Override
     public void spawn(StackedSpawner stackedSpawner, boolean onlyCheckConditions) {
+        if (NMSUtil.isFolia() && !FoliaCompat.canUseLocation(stackedSpawner.getLocation())) {
+            // Folia: vanilla ticks spawners on the owning region already; anything else hops there
+            Location spawnerLocation = stackedSpawner.getLocation();
+            RoseStacker.getInstance().getScheduler().runTaskAtLocation(spawnerLocation, () -> this.spawn(stackedSpawner, onlyCheckConditions));
+            return;
+        }
+
         StackedSpawnerTile spawnerTile = stackedSpawner.getSpawnerTile();
         SpawnerStackSettings stackSettings = stackedSpawner.getStackSettings();
         EntityStackSettings entityStackSettings = RoseStacker.getInstance().getManager(StackSettingManager.class).getEntityStackSettings(this.entityType);
@@ -120,6 +128,12 @@ public class MobSpawningMethod implements SpawningMethod {
                 Location spawnLocation = stackedSpawner.getLocation().clone().add(xOffset + 0.5, yOffset, zOffset + 0.5);
                 if (invalidLocations.containsKey(spawnLocation)) {
                     // Decrease max failed spawn attempts if the location is invalid to avoid spinning forever
+                    maxFailedSpawnAttempts--;
+                    continue;
+                }
+
+                if (NMSUtil.isFolia() && !FoliaCompat.canUseLocation(spawnLocation)) {
+                    // Spawn candidate sits in a region we don't own (boundary); pick another one
                     maxFailedSpawnAttempts--;
                     continue;
                 }
@@ -207,14 +221,18 @@ public class MobSpawningMethod implements SpawningMethod {
             } else {
                 // Spawn particles indicating the spawn occurred
                 stackedSpawner.getWorld().spawnParticle(Particle.FLAME, stackedSpawner.getLocation().clone().add(0.5, 0.5, 0.5), 50, 0.5, 0.5, 0.5, 0);
-                ThreadUtils.runSync(() -> {
+                ThreadUtils.runSync(stackedSpawner.getLocation(), () -> {
                     if (stackedSpawner.getBlock().getType() == Material.SPAWNER)
                         PersistentDataUtils.increaseSpawnCount(spawnerTile, successfulSpawns);
                 });
             }
         };
 
-        if (SettingKey.SPAWNER_SPAWN_ASYNC.get()) {
+        if (NMSUtil.isFolia()) {
+            // Folia: spawn condition checks read blocks/entities, which is only legal on the spawner's own
+            // region thread (where vanilla ticks the spawner anyway) - async spawning is not possible
+            spawnTask.run();
+        } else if (SettingKey.SPAWNER_SPAWN_ASYNC.get()) {
             ThreadUtils.runAsync(spawnTask);
         } else {
             spawnTask.run();
@@ -236,13 +254,16 @@ public class MobSpawningMethod implements SpawningMethod {
 
         List<Location> possibleLocations = new ArrayList<>(locations);
         int finalSpawnAmount = spawnAmount;
-        ThreadUtils.runSync(() -> { // No poof particles to show where the mobs spawn with this setting, they immediately try stacking and are entirely unpredictable
+        ThreadUtils.runSync(stackedSpawner.getLocation(), () -> { // No poof particles to show where the mobs spawn with this setting, they immediately try stacking and are entirely unpredictable
             NMSHandler nmsHandler = NMSAdapter.getHandler();
             for (int i = 0; i < finalSpawnAmount; i++) {
                 if (locations.isEmpty())
                     break;
 
                 Location location = possibleLocations.get(this.random.nextInt(possibleLocations.size()));
+                if (NMSUtil.isFolia() && !FoliaCompat.canUseLocation(location))
+                    continue; // Region boundary shifted since the candidate was chosen
+
                 if (NMSUtil.isPaper()) {
                     var result = PreCreatureSpawnEventHelper.call(location, this.entityType, CreatureSpawnEvent.SpawnReason.SPAWNER);
                     if (result.abort())
@@ -347,12 +368,15 @@ public class MobSpawningMethod implements SpawningMethod {
 
         modifiedStacks.forEach(StackedEntity::updateDisplay);
 
-        ThreadUtils.runSync(() -> {
+        ThreadUtils.runSync(stackedSpawner.getLocation(), () -> {
             stackManager.setEntityStackingTemporarilyDisabled(true);
             Iterator<StackedEntity> iterator = newStacks.iterator();
             while (iterator.hasNext()) {
                 StackedEntity stackedEntity = iterator.next();
                 LivingEntity entity = stackedEntity.getEntity();
+
+                if (NMSUtil.isFolia() && !FoliaCompat.canUseLocation(entity.getLocation()))
+                    continue; // Region boundary shifted since the spawn candidate was chosen
 
                 if (NMSUtil.isPaper()) {
                     var result = PreCreatureSpawnEventHelper.call(entity.getLocation(), this.entityType, CreatureSpawnEvent.SpawnReason.SPAWNER);

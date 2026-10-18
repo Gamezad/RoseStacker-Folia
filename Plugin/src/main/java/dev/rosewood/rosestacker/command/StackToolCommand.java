@@ -10,6 +10,7 @@ import dev.rosewood.rosegarden.command.framework.annotation.RoseExecutable;
 import dev.rosewood.rosegarden.utils.StringPlaceholders;
 import dev.rosewood.rosestacker.manager.LocaleManager;
 import dev.rosewood.rosestacker.utils.ItemUtils;
+import dev.rosewood.rosestacker.utils.ThreadUtils;
 import org.bukkit.entity.Player;
 
 public class StackToolCommand extends BaseRoseCommand {
@@ -32,14 +33,13 @@ public class StackToolCommand extends BaseRoseCommand {
                 return;
             }
 
-            player.getInventory().addItem(ItemUtils.getStackingTool());
+            ThreadUtils.runSync(player, () -> player.getInventory().addItem(ItemUtils.getStackingTool()));
             localeManager.sendCommandMessage(player, "command-stacktool-given");
         } else {
-            target.getInventory().addItem(ItemUtils.getStackingTool());
+            ThreadUtils.runSync(target, () -> target.getInventory().addItem(ItemUtils.getStackingTool()));
             localeManager.sendCommandMessage(context.getSender(), "command-stacktool-given-other", StringPlaceholders.of("player", target.getName()));
         }
     }
-
     @Override
     protected CommandInfo createCommandInfo() {
         return CommandInfo.builder("stacktool")
