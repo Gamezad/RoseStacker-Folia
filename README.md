@@ -1,5 +1,7 @@
 ![](https://imgur.com/3ADh05A.png)
 
+## Fork Changes:
+ Support Folia servers
 
 RoseStacker is a plugin that allows you to stack mobs, items, spawners, and blocks. The purpose of the plugin is to add cool and new functionality to your server, and to alleviate common sources of server lag through minimizing the loaded entities and items in your worlds.
 
