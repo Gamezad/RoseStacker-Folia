@@ -11,6 +11,7 @@ import dev.rosewood.rosestacker.stack.StackedEntity;
 import dev.rosewood.rosestacker.stack.StackedItem;
 import dev.rosewood.rosestacker.stack.StackedSpawner;
 import dev.rosewood.rosestacker.utils.EntityUtils;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import dev.rosewood.rosestacker.utils.ItemUtils;
 import dev.rosewood.rosestacker.utils.PersistentDataUtils;
 import dev.rosewood.rosestacker.utils.StackerUtils;
@@ -87,10 +88,14 @@ public class StackToolListener implements Listener {
             localeManager.sendCommandMessage(player, "command-stacktool-marked-" + stackableStr, StringPlaceholders.of("type", stackedEntity.getStackSettings().getDisplayName()));
         } else {
             PersistentDataUtils.setUnstackable(entity, true);
-            ThreadUtils.runAsync(() -> stackedEntity.getDataStorage().forEachTransforming(x -> {
+            Runnable markStackUnstackable = () -> stackedEntity.getDataStorage().forEachTransforming(x -> {
                 PersistentDataUtils.setUnstackable(x, true);
                 return true;
-            }));
+            });
+            if (FoliaCompat.isFolia())
+                ThreadUtils.runOnPrimary(entity, markStackUnstackable);
+            else
+                ThreadUtils.runAsync(markStackUnstackable);
             localeManager.sendCommandMessage(player, "command-stacktool-marked-all-unstackable", StringPlaceholders.of("type", stackedEntity.getStackSettings().getDisplayName()));
         }
     }

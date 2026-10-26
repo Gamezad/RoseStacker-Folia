@@ -615,8 +615,6 @@ public class StackingThread implements StackingLogic, AutoCloseable {
 
         Location entityLocation = entity.getLocation();
         double particleHeight = entity.getEyeHeight(true) + 0.75;
-        boolean displayStackingToolParticles;
-
         for (PlayerCacheManager.PlayerSnapshot snapshot : playerCacheManager.getWorldSnapshots(this.targetWorld.getName())) {
             double dx = snapshot.getX() - entityLocation.getX();
             double dy = snapshot.getY() - entityLocation.getY();
@@ -631,28 +629,23 @@ public class StackingThread implements StackingLogic, AutoCloseable {
                 continue;
 
             boolean visible = distanceSqrd < this.entityDynamicViewRangeSqrd;
-            if (visible && this.entityDynamicWallDetection) {
-                try {
-                    visible &= EntityUtils.hasLineOfSight(player, entity, 0.75, true);
-                } catch (Throwable e) {
-                    // The raycast crossed into a region we don't own; treat as visible rather than failing
-                }
-            }
+            if (visible && this.entityDynamicWallDetection && FoliaCompat.canUseEntity(player))
+                visible &= EntityUtils.hasLineOfSight(player, entity, 0.75, true);
 
-            nmsHandler.updateEntityNameTagForPlayer(player, entity, displayName, displayNameVisible && visible);
+            boolean nameTagVisible = displayNameVisible && visible;
+            boolean showStackingToolParticles = visible && snapshot.isStackingTool();
+            Location particleLocation = entityLocation.clone().add(0, particleHeight, 0);
+            DustOptions dustOptions = PersistentDataUtils.isUnstackable(entity)
+                    ? StackerUtils.UNSTACKABLE_DUST_OPTIONS
+                    : StackerUtils.STACKABLE_DUST_OPTIONS;
+            ThreadUtils.runOnPrimary(player, () -> {
+                if (!player.isOnline())
+                    return;
 
-            // Spawn particles for holding the stacking tool
-            displayStackingToolParticles = snapshot.isStackingTool();
-            if (visible && displayStackingToolParticles) {
-                Location location = entityLocation.clone().add(0, particleHeight, 0);
-                DustOptions dustOptions;
-                if (PersistentDataUtils.isUnstackable(entity)) {
-                    dustOptions = StackerUtils.UNSTACKABLE_DUST_OPTIONS;
-                } else {
-                    dustOptions = StackerUtils.STACKABLE_DUST_OPTIONS;
-                }
-                player.spawnParticle(VersionUtils.DUST, location, 1, 0.0, 0.0, 0.0, 0.0, dustOptions);
-            }
+                nmsHandler.updateEntityNameTagForPlayer(player, entity, displayName, nameTagVisible);
+                if (showStackingToolParticles)
+                    player.spawnParticle(VersionUtils.DUST, particleLocation, 1, 0.0, 0.0, 0.0, 0.0, dustOptions);
+            });
         }
     }
 
@@ -678,19 +671,38 @@ public class StackingThread implements StackingLogic, AutoCloseable {
                 continue;
 
             boolean visible = distanceSqrd < this.itemDynamicViewRangeSqrd;
-            if (visible && this.itemDynamicWallDetection) {
-                try {
-                    visible &= EntityUtils.hasLineOfSight(player, item, 0.75, true);
-                } catch (Throwable e) {
-                    // The raycast crossed into a region we don't own; treat as visible rather than failing
-                }
-            }
+            if (visible && this.itemDynamicWallDetection && FoliaCompat.canUseEntity(player))
+                visible &= EntityUtils.hasLineOfSight(player, item, 0.75, true);
 
-            nmsHandler.updateEntityNameTagVisibilityForPlayer(player, item, visible);
+            boolean nameTagVisible = visible;
+            ThreadUtils.runOnPrimary(player, () -> {
+                if (player.isOnline())
+                    nmsHandler.updateEntityNameTagVisibilityForPlayer(player, item, nameTagVisible);
+            });
         }
     }
 
     private void updateHolograms() {
+        if (FoliaCompat.isFolia()) {
+            // This timer is an async driver. Batch each chunk's block-owned displays onto that
+            // chunk's region instead of touching spawner tiles / block state from the worker.
+            for (Map.Entry<Chunk, StackChunkData> entry : this.stackChunkData.entrySet()) {
+                Chunk chunk = entry.getKey();
+                StackChunkData chunkData = entry.getValue();
+                Location chunkLocation = new Location(chunk.getWorld(), (chunk.getX() << 4) + 8, 0, (chunk.getZ() << 4) + 8);
+                this.rosePlugin.getScheduler().runTaskAtLocation(chunkLocation, () -> {
+                    if (!chunk.getWorld().isChunkLoaded(chunk.getX(), chunk.getZ()))
+                        return;
+
+                    for (StackedSpawner stackedSpawner : chunkData.getSpawners().values())
+                        stackedSpawner.updateDisplay();
+                    for (StackedBlock stackedBlock : chunkData.getBlocks().values())
+                        stackedBlock.updateDisplay();
+                });
+            }
+            return;
+        }
+
         if (this.updatingHolograms)
             return;
 
@@ -734,8 +746,12 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         this.chunkMaintenanceTasks.clear();
         this.chunkMaintenanceCycles.clear();
 
-        // Save all data
-        this.saveAllData(true);
+        // Paper can synchronously flush all worlds from its primary thread. Folia must route every
+        // chunk/entity write to its owner; never walk all regions from this closing thread.
+        if (FoliaCompat.isFolia())
+            this.autosave();
+        else
+            this.saveAllData(true);
     }
 
     /**
@@ -827,20 +843,18 @@ public class StackingThread implements StackingLogic, AutoCloseable {
      * {@link dev.rosewood.rosestacker.manager.StackManager#backfillChunkMaintenance()}.
      */
     public void backfillChunkMaintenance() {
-        if (this.disabled || !FoliaCompat.isFolia())
+        if (this.disabled || !FoliaCompat.isFolia() || FoliaCompat.isRegionsTicking())
             return;
 
-        try {
-            for (Chunk chunk : this.targetWorld.getLoadedChunks()) {
-                if (this.chunkMaintenanceTasks.containsKey(chunkKey(chunk.getX(), chunk.getZ())))
-                    continue; // Already covered by the startup scan or chunk load events
+        // This scan is only valid during single-threaded startup. After region ticking begins every
+        // chunk is covered by its load callback; a global loaded-chunk scan would cross region owners.
+        for (Chunk chunk : this.targetWorld.getLoadedChunks()) {
+            if (this.chunkMaintenanceTasks.containsKey(chunkKey(chunk.getX(), chunk.getZ())))
+                continue; // Already covered by the startup scan or chunk load events
 
-                this.loadChunkEntities(Arrays.asList(chunk.getEntities()));
-                this.loadChunkBlocks(chunk);
-                this.onChunkLoaded(chunk);
-            }
-        } catch (Exception e) {
-            this.rosePlugin.getLogger().warning("Folia: could not backfill chunk maintenance for world '" + this.targetWorld.getName() + "' (" + e.getMessage() + ")");
+            this.loadChunkEntities(Arrays.asList(chunk.getEntities()));
+            this.loadChunkBlocks(chunk);
+            this.onChunkLoaded(chunk);
         }
     }
 
@@ -1435,9 +1449,12 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         if (!stackedSpawners.isEmpty() || !stackedBlocks.isEmpty()) {
             this.stackChunkData.put(chunk, new StackChunkData(stackedSpawners, stackedBlocks));
 
-            // During startup the region threads aren't ticking yet and the displays are created by the
-            // hologram task once they are, scheduling them now would only add work to the first tick
-            if (!FoliaCompat.isFolia() || FoliaCompat.isRegionsTicking()) {
+            if (FoliaCompat.isFolia()) {
+                // loadChunkBlocks is called by the chunk's owning region (or during single-threaded
+                // startup), so tile and display state is safe to initialize inline here.
+                stackedSpawners.values().forEach(StackedSpawner::updateDisplay);
+                stackedBlocks.values().forEach(StackedBlock::updateDisplay);
+            } else {
                 ThreadUtils.runAsync(() -> {
                     stackedSpawners.values().forEach(StackedSpawner::updateDisplay);
                     stackedBlocks.values().forEach(StackedBlock::updateDisplay);
@@ -1507,10 +1524,17 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         }
 
         if (!stackedEntities.isEmpty() || !stackedItems.isEmpty()) {
-            ThreadUtils.runAsync(() -> {
+            if (FoliaCompat.isFolia()) {
+                // The chunk load callback owns these entities; keep metadata and display updates on
+                // that region instead of dispatching them to an arbitrary worker.
                 stackedEntities.forEach(StackedEntity::updateDisplay);
                 stackedItems.forEach(StackedItem::updateDisplay);
-            });
+            } else {
+                ThreadUtils.runAsync(() -> {
+                    stackedEntities.forEach(StackedEntity::updateDisplay);
+                    stackedItems.forEach(StackedItem::updateDisplay);
+                });
+            }
         }
     }
 
@@ -1601,6 +1625,13 @@ public class StackingThread implements StackingLogic, AutoCloseable {
 
     @Override
     public void saveAllData(boolean clearStored) {
+        if (FoliaCompat.isFolia()) {
+            // A world-wide synchronous save would cross region ownership. Route writes individually;
+            // do not clear the in-memory indexes before those owner-thread writes have run.
+            this.autosave();
+            return;
+        }
+
         // Save stacked blocks and spawners
         for (Chunk chunk : this.stackChunkData.keySet())
             this.saveChunkBlocks(chunk, false);
@@ -1630,16 +1661,14 @@ public class StackingThread implements StackingLogic, AutoCloseable {
         }
 
         // Blocks and spawners: save each chunk's data from the region that owns the chunk
-        for (Map.Entry<Chunk, StackChunkData> entry : this.stackChunkData.entrySet()) {
-            StackChunkData stackChunkData = entry.getValue();
-            Block anchor = stackChunkData.getSpawners().keySet().stream().findFirst().orElse(null);
-            if (anchor == null)
-                anchor = stackChunkData.getBlocks().keySet().stream().findFirst().orElse(null);
-            if (anchor == null)
-                continue;
-
-            Chunk chunk = entry.getKey();
-            this.rosePlugin.getScheduler().runTaskAtLocation(anchor.getLocation(), () -> this.saveChunkBlocks(chunk, false));
+        for (Chunk chunk : this.stackChunkData.keySet()) {
+            // Chunk coordinates are immutable metadata; do not call Block#getLocation or touch its
+            // state from this global/async autosave driver.
+            Location chunkLocation = new Location(chunk.getWorld(), (chunk.getX() << 4) + 8, 0, (chunk.getZ() << 4) + 8);
+            this.rosePlugin.getScheduler().runTaskAtLocation(chunkLocation, () -> {
+                if (chunk.getWorld().isChunkLoaded(chunk.getX(), chunk.getZ()))
+                    this.saveChunkBlocks(chunk, false);
+            });
         }
 
         // Entities and items: save each stack's data from the region that owns its entity

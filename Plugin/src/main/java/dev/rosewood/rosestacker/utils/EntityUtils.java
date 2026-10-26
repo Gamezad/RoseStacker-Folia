@@ -233,6 +233,11 @@ public final class EntityUtils {
         if (!knownReadable && !FoliaCompat.canUseLocation(location))
             return Material.AIR; // Folia: another region owns this block, reading it from here is not allowed
 
+        int chunkX = location.getBlockX() >> 4;
+        int chunkZ = location.getBlockZ() >> 4;
+        if (FoliaCompat.isFolia() && !world.isChunkLoaded(chunkX, chunkZ))
+            return Material.AIR; // On Folia, never turn a block lookup into an implicit chunk load
+
         // TODO: Account for the maximum size of slimes and magma cubes
 
         try {

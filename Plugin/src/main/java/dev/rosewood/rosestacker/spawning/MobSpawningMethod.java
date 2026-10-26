@@ -138,7 +138,14 @@ public class MobSpawningMethod implements SpawningMethod {
                     continue;
                 }
 
-                Block target = stackedSpawner.getLocation().clone().add(xOffset, yOffset, zOffset).getBlock();
+                Location targetLocation = stackedSpawner.getLocation().clone().add(xOffset, yOffset, zOffset);
+                if (FoliaCompat.isFolia() && !stackedSpawner.getWorld().isChunkLoaded(targetLocation.getBlockX() >> 4, targetLocation.getBlockZ() >> 4)) {
+                    // Spawner candidates must not implicitly load a neighboring chunk. Treat an
+                    // unloaded candidate as a failed attempt and let the next tick retry normally.
+                    maxFailedSpawnAttempts--;
+                    continue;
+                }
+                Block target = targetLocation.getBlock();
 
                 unmetConditions.clear();
                 boolean invalid = false;

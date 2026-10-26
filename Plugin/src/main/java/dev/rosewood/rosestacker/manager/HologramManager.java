@@ -109,18 +109,21 @@ public class HologramManager extends Manager implements Listener {
         if (player == null)
             return;
 
-        if (inRange) {
-            hologram.addWatcher(player);
-            if (this.hideThroughWalls) {
-                try {
-                    hologram.setVisibility(player, this.nmsHandler.hasLineOfSight(player, hologram.getDisplayLocation()));
-                } catch (Throwable e) {
-                    // The raycast crossed a region boundary; keep the current visibility state
-                }
+        // Hologram watcher changes operate on the player's connection. A snapshot makes the
+        // distance calculation safe off-thread, but does not make Player packet operations safe.
+        ThreadUtils.runOnPrimary(player, () -> {
+            if (!player.isOnline())
+                return;
+
+            if (inRange) {
+                hologram.addWatcher(player);
+                Location displayLocation = hologram.getDisplayLocation();
+                if (this.hideThroughWalls && FoliaCompat.canUseLocation(displayLocation))
+                    hologram.setVisibility(player, this.nmsHandler.hasLineOfSight(player, displayLocation));
+            } else {
+                hologram.removeWatcher(player);
             }
-        } else {
-            hologram.removeWatcher(player);
-        }
+        });
     }
 
     private boolean isPlayerInRange(Player player, Location location) {
@@ -152,11 +155,15 @@ public class HologramManager extends Manager implements Listener {
 
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
-        ThreadUtils.runAsync(() -> {
-            Player player = event.getPlayer();
+        Player player = event.getPlayer();
+        Runnable removeWatcher = () -> {
             for (Hologram hologram : this.holograms.values())
                 hologram.removeWatcher(player);
-        });
+        };
+        if (FoliaCompat.isFolia())
+            ThreadUtils.runOnPrimary(player, removeWatcher);
+        else
+            ThreadUtils.runAsync(removeWatcher);
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)

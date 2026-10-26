@@ -45,11 +45,13 @@ allprojects {
 
         maven {
             url = 'https://repo.rosewooddev.io/repository/maven-public'
-            credentials {
-                username project.mavenUser
-                password project.mavenPassword
-                authentication {
-                    basic(BasicAuthentication)
+            if (project.hasProperty('mavenUser') && project.hasProperty('mavenPassword')) {
+                credentials {
+                    username project.property('mavenUser')
+                    password project.property('mavenPassword')
+                    authentication {
+                        basic(BasicAuthentication)
+                    }
                 }
             }
         }

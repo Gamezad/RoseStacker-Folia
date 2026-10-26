@@ -19,6 +19,7 @@ import dev.rosewood.rosestacker.stack.settings.EntityStackSettings;
 import dev.rosewood.rosestacker.stack.settings.ItemStackSettings;
 import dev.rosewood.rosestacker.stack.settings.SpawnerStackSettings;
 import dev.rosewood.rosestacker.utils.EntityUtils;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import dev.rosewood.rosestacker.utils.ItemUtils;
 import dev.rosewood.rosestacker.utils.PersistentDataUtils;
 import dev.rosewood.rosestacker.utils.ThreadUtils;
@@ -623,10 +624,14 @@ public class EntityListener implements Listener {
             return;
 
         if (stackedEntity.getStackSize() == 1) {
-            ThreadUtils.runAsync(() -> {
+            Runnable restack = () -> {
                 stackedEntity.resetHasMoved();
                 this.stackManager.tryStackEntity(stackedEntity);
-            });
+            };
+            if (FoliaCompat.isFolia())
+                ThreadUtils.runOnPrimary(sheepEntity, restack);
+            else
+                ThreadUtils.runAsync(restack);
             return;
         }
 
@@ -640,13 +645,13 @@ public class EntityListener implements Listener {
 
         ShearedHandler shearedHandler = CompatibilityAdapter.getShearedHandler();
         List<ItemStack> drops = new ArrayList<>();
-        this.stackManager.setEntityUnstackingTemporarilyDisabled(true);
 
-        // Capture the drop location on the owning region before going async
+        // Capture the drop location on the owning region before any asynchronous Paper work
         Location shearDropLocation = sheepEntity.getLocation();
         shearDropLocation.add(0, sheepEntity.getEyeHeight(), 0);
 
-        ThreadUtils.runAsync(() -> {
+        Runnable shearStack = () -> {
+            this.stackManager.setEntityUnstackingTemporarilyDisabled(true);
             try {
                 stackedEntity.getDataStorage().forEachTransforming(internal -> {
                     Sheep sheep = (Sheep) internal;
@@ -662,7 +667,14 @@ public class EntityListener implements Listener {
             } finally {
                 this.stackManager.setEntityUnstackingTemporarilyDisabled(false);
             }
-        });
+        };
+        if (FoliaCompat.isFolia()) {
+            ThreadUtils.runOnPrimary(sheepEntity, shearStack);
+        } else {
+            // Keep Paper's existing guard active while the worker is queued.
+            this.stackManager.setEntityUnstackingTemporarilyDisabled(true);
+            ThreadUtils.runAsync(shearStack);
+        }
     }
 
     /**
@@ -698,14 +710,28 @@ public class EntityListener implements Listener {
             return;
 
         AtomicInteger regrowRemaining = new AtomicInteger(regrowAmount);
-        ThreadUtils.runAsync(() -> stackedEntity.getDataStorage().forEachTransforming(internal -> {
-            Sheep sheep = (Sheep) internal;
-            if (shearedHandler.isSheared(sheep) && regrowRemaining.getAndDecrement() > 0) {
-                shearedHandler.setSheared(sheep, false);
-                return true;
-            }
-            return false;
-        }));
+        Runnable regrowStoredSheep = () -> {
+            // This event can be queued if its entity retires between scheduling and execution. Do not
+            // mutate stale stack data after the anchor sheep has left the world or its stack changed.
+            if (!sheepEntity.isValid() || this.stackManager.getStackedEntity(sheepEntity) != stackedEntity)
+                return;
+
+            stackedEntity.getDataStorage().forEachTransforming(internal -> {
+                Sheep sheep = (Sheep) internal;
+                if (shearedHandler.isSheared(sheep) && regrowRemaining.getAndDecrement() > 0) {
+                    shearedHandler.setSheared(sheep, false);
+                    return true;
+                }
+                return false;
+            });
+        };
+
+        // The stored sheep are reconstructed as detached Bukkit entities, but their NMS state is still
+        // owned by the stack's anchor region. Never invoke PaperShearable from a worker thread on Folia.
+        if (FoliaCompat.isFolia())
+            ThreadUtils.runOnPrimary(sheepEntity, regrowStoredSheep);
+        else
+            ThreadUtils.runAsync(regrowStoredSheep);
     }
 
 }

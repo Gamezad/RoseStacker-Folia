@@ -22,6 +22,7 @@ import dev.rosewood.rosestacker.stack.settings.EntityStackSettings;
 import dev.rosewood.rosestacker.stack.settings.MultikillBound;
 import dev.rosewood.rosestacker.stack.settings.SpawnerStackSettings;
 import dev.rosewood.rosestacker.utils.DataUtils;
+import dev.rosewood.rosestacker.utils.FoliaCompat;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.HashMap;
@@ -117,8 +118,10 @@ public class StackManager extends Manager implements StackingLogic {
             this.autosaveTask = null;
         }
 
-        // Save anything that's loaded
-        this.saveAllData(true);
+        // Paper can flush everything synchronously. On Folia each StackingThread#close routes its
+        // writes to the owning region instead of inspecting other regions here.
+        if (!FoliaCompat.isFolia())
+            this.saveAllData(true);
 
         // Close and clear StackingThreads
         this.stackingThreads.values().forEach(StackingThread::close);
