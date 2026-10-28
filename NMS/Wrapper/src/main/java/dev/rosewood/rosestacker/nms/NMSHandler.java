@@ -97,20 +97,36 @@ public interface NMSHandler {
      * Updates the name and visibility of an Entity's nametag for a Player
      *
      * @param player The Player to send the packet to
-     * @param entity The Entity to toggle
+     * @param entityId The entity ID captured on the entity's owning thread
      * @param customName The name to display for the entity, nullable
      * @param customNameVisible true to make the nametag visible, otherwise false
      */
-    void updateEntityNameTagForPlayer(Player player, Entity entity, String customName, boolean customNameVisible);
+    void updateEntityNameTagForPlayer(Player player, int entityId, String customName, boolean customNameVisible);
+
+    /**
+     * Compatibility overload for callers already executing on the entity's owning thread.
+     * Do not call from a player region when the entity may belong to another region.
+     */
+    default void updateEntityNameTagForPlayer(Player player, Entity entity, String customName, boolean customNameVisible) {
+        this.updateEntityNameTagForPlayer(player, entity.getEntityId(), customName, customNameVisible);
+    }
 
     /**
      * Updates the visibility of an Entity's nametag for a Player
      *
      * @param player The Player to send the packet to
-     * @param entity The Entity to toggle
+     * @param entityId The entity ID captured on the entity's owning thread
      * @param customNameVisible true to make the nametag visible, otherwise false
      */
-    void updateEntityNameTagVisibilityForPlayer(Player player, Entity entity, boolean customNameVisible);
+    void updateEntityNameTagVisibilityForPlayer(Player player, int entityId, boolean customNameVisible);
+
+    /**
+     * Compatibility overload for callers already executing on the entity's owning thread.
+     * Do not call from a player region when the entity may belong to another region.
+     */
+    default void updateEntityNameTagVisibilityForPlayer(Player player, Entity entity, boolean customNameVisible) {
+        this.updateEntityNameTagVisibilityForPlayer(player, entity.getEntityId(), customNameVisible);
+    }
 
     /**
      * Unignites a creeper

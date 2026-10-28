@@ -517,7 +517,7 @@ public class StackingThread implements StackingLogic, AutoCloseable {
 
                         StackedEntity stackedEntity = this.getStackedEntity(entity);
                         if (stackedEntity != null)
-                            nmsHandler.updateEntityNameTagForPlayer(player, entity, stackedEntity.getDisplayName(), stackedEntity.isDisplayNameVisible() && visible);
+                            nmsHandler.updateEntityNameTagForPlayer(player, entity.getEntityId(), stackedEntity.getDisplayName(), stackedEntity.isDisplayNameVisible() && visible);
 
                         // Spawn particles for holding the stacking tool
                         if (visible && displayStackingToolParticles) {
@@ -552,7 +552,7 @@ public class StackingThread implements StackingLogic, AutoCloseable {
                         if (this.itemDynamicWallDetection)
                             visible &= EntityUtils.hasLineOfSight(player, item, 0.75, true);
 
-                        nmsHandler.updateEntityNameTagVisibilityForPlayer(player, item, visible);
+                        nmsHandler.updateEntityNameTagVisibilityForPlayer(player, item.getEntityId(), visible);
                     }
                 }
             }
@@ -610,6 +610,7 @@ public class StackingThread implements StackingLogic, AutoCloseable {
             return;
 
         NMSHandler nmsHandler = NMSAdapter.getHandler();
+        int entityId = entity.getEntityId(); // Capture on this entity's owning region before dispatching to player regions
         String displayName = stackedEntity.getDisplayName();
         boolean displayNameVisible = stackedEntity.isDisplayNameVisible();
 
@@ -642,7 +643,7 @@ public class StackingThread implements StackingLogic, AutoCloseable {
                 if (!player.isOnline())
                     return;
 
-                nmsHandler.updateEntityNameTagForPlayer(player, entity, displayName, nameTagVisible);
+                nmsHandler.updateEntityNameTagForPlayer(player, entityId, displayName, nameTagVisible);
                 if (showStackingToolParticles)
                     player.spawnParticle(VersionUtils.DUST, particleLocation, 1, 0.0, 0.0, 0.0, 0.0, dustOptions);
             });
@@ -655,6 +656,7 @@ public class StackingThread implements StackingLogic, AutoCloseable {
             return;
 
         NMSHandler nmsHandler = NMSAdapter.getHandler();
+        int entityId = item.getEntityId(); // Capture on this item's owning region before dispatching to player regions
         Location itemLocation = item.getLocation();
 
         for (PlayerCacheManager.PlayerSnapshot snapshot : playerCacheManager.getWorldSnapshots(this.targetWorld.getName())) {
@@ -677,7 +679,7 @@ public class StackingThread implements StackingLogic, AutoCloseable {
             boolean nameTagVisible = visible;
             ThreadUtils.runOnPrimary(player, () -> {
                 if (player.isOnline())
-                    nmsHandler.updateEntityNameTagVisibilityForPlayer(player, item, nameTagVisible);
+                    nmsHandler.updateEntityNameTagVisibilityForPlayer(player, entityId, nameTagVisible);
             });
         }
     }

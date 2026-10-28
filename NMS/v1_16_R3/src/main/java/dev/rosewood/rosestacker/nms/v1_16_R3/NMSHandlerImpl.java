@@ -245,14 +245,14 @@ public class NMSHandlerImpl implements NMSHandler {
     }
 
     @Override
-    public void updateEntityNameTagForPlayer(Player player, org.bukkit.entity.Entity entity, String customName, boolean customNameVisible) {
+    public void updateEntityNameTagForPlayer(Player player, int entityId, String customName, boolean customNameVisible) {
         try {
             List<DataWatcher.Item<?>> dataWatchers = new ArrayList<>();
             Optional<IChatBaseComponent> nameComponent = Optional.ofNullable(CraftChatMessage.fromStringOrNull(customName));
             dataWatchers.add(new DataWatcher.Item<>(DataWatcherRegistry.f.a(2), nameComponent));
             dataWatchers.add(new DataWatcher.Item<>(DataWatcherRegistry.i.a(3), customNameVisible));
 
-            PacketPlayOutEntityMetadata packetPlayOutEntityMetadata = new PacketPlayOutEntityMetadata(entity.getEntityId(), new DataWatcherWrapper(dataWatchers), false);
+            PacketPlayOutEntityMetadata packetPlayOutEntityMetadata = new PacketPlayOutEntityMetadata(entityId, new DataWatcherWrapper(dataWatchers), false);
             ((CraftPlayer) player).getHandle().playerConnection.sendPacket(packetPlayOutEntityMetadata);
         } catch (Exception e) {
             e.printStackTrace();
@@ -260,10 +260,10 @@ public class NMSHandlerImpl implements NMSHandler {
     }
 
     @Override
-    public void updateEntityNameTagVisibilityForPlayer(Player player, org.bukkit.entity.Entity entity, boolean customNameVisible) {
+    public void updateEntityNameTagVisibilityForPlayer(Player player, int entityId, boolean customNameVisible) {
         try {
             List<DataWatcher.Item<?>> dataItems = Lists.newArrayList(new DataWatcher.Item<>(DataWatcherRegistry.i.a(3), customNameVisible));
-            PacketPlayOutEntityMetadata packetPlayOutEntityMetadata = new PacketPlayOutEntityMetadata(entity.getEntityId(), new DataWatcherWrapper(dataItems), false);
+            PacketPlayOutEntityMetadata packetPlayOutEntityMetadata = new PacketPlayOutEntityMetadata(entityId, new DataWatcherWrapper(dataItems), false);
             ((CraftPlayer) player).getHandle().playerConnection.sendPacket(packetPlayOutEntityMetadata);
         } catch (Exception e) {
             e.printStackTrace();

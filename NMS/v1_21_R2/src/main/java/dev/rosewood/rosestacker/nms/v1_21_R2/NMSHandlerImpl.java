@@ -257,14 +257,14 @@ public class NMSHandlerImpl implements NMSHandler {
     }
 
     @Override
-    public void updateEntityNameTagForPlayer(Player player, org.bukkit.entity.Entity entity, String customName, boolean customNameVisible) {
+    public void updateEntityNameTagForPlayer(Player player, int entityId, String customName, boolean customNameVisible) {
         try {
             List<SynchedEntityData.DataValue<?>> dataValues = new ArrayList<>();
             Optional<Component> nameComponent = Optional.ofNullable(CraftChatMessage.fromStringOrNull(customName));
             dataValues.add(SynchedEntityData.DataValue.create(EntityDataSerializers.OPTIONAL_COMPONENT.createAccessor(2), nameComponent));
             dataValues.add(SynchedEntityData.DataValue.create(EntityDataSerializers.BOOLEAN.createAccessor(3), customNameVisible));
 
-            ClientboundSetEntityDataPacket entityDataPacket = new ClientboundSetEntityDataPacket(entity.getEntityId(), dataValues);
+            ClientboundSetEntityDataPacket entityDataPacket = new ClientboundSetEntityDataPacket(entityId, dataValues);
             ((CraftPlayer) player).getHandle().connection.send(entityDataPacket);
         } catch (Exception e) {
             e.printStackTrace();
@@ -272,10 +272,10 @@ public class NMSHandlerImpl implements NMSHandler {
     }
 
     @Override
-    public void updateEntityNameTagVisibilityForPlayer(Player player, org.bukkit.entity.Entity entity, boolean customNameVisible) {
+    public void updateEntityNameTagVisibilityForPlayer(Player player, int entityId, boolean customNameVisible) {
         try {
             List<SynchedEntityData.DataValue<?>> dataValues = Lists.newArrayList(SynchedEntityData.DataValue.create(EntityDataSerializers.BOOLEAN.createAccessor(3), customNameVisible));
-            ClientboundSetEntityDataPacket entityDataPacket = new ClientboundSetEntityDataPacket(entity.getEntityId(), dataValues);
+            ClientboundSetEntityDataPacket entityDataPacket = new ClientboundSetEntityDataPacket(entityId, dataValues);
             ((CraftPlayer) player).getHandle().connection.send(entityDataPacket);
         } catch (Exception e) {
             e.printStackTrace();

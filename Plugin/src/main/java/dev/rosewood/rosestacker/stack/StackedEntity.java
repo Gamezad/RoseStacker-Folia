@@ -16,6 +16,7 @@ import dev.rosewood.rosestacker.hook.SpawnerFlagPersistenceHook;
 import dev.rosewood.rosestacker.hook.WorldGuardHook;
 import dev.rosewood.rosestacker.manager.EntityCacheManager;
 import dev.rosewood.rosestacker.manager.LocaleManager;
+import dev.rosewood.rosestacker.manager.PlayerCacheManager;
 import dev.rosewood.rosestacker.manager.StackManager;
 import dev.rosewood.rosestacker.manager.StackSettingManager;
 import dev.rosewood.rosestacker.nms.NMSAdapter;
@@ -670,12 +671,44 @@ public class StackedEntity extends Stack<EntityStackSettings> implements Compara
             ThreadUtils.runSync(this.entity, this::updateDisplay);
             return;
         }
+        if (!this.entity.isValid())
+            return;
 
         this.displayName = null;
         String displayName = this.getDisplayName();
+        boolean displayNameVisible = this.displayNameVisible;
         NMSHandler nmsHandler = NMSAdapter.getHandler();
+        int entityId = this.entity.getEntityId();
+
+        if (FoliaCompat.isFolia()) {
+            // The entity ID is captured on the entity's region. Player connection access is then
+            // performed on each recipient's region without carrying the live entity into that task.
+            PlayerCacheManager playerCacheManager = RoseStacker.getInstance().getManager(PlayerCacheManager.class);
+            if (playerCacheManager == null)
+                return;
+
+            Location entityLocation = this.entity.getLocation();
+            for (PlayerCacheManager.PlayerSnapshot snapshot : playerCacheManager.getWorldSnapshots(entityLocation.getWorld().getName())) {
+                double dx = snapshot.getX() - entityLocation.getX();
+                double dy = snapshot.getY() - entityLocation.getY();
+                double dz = snapshot.getZ() - entityLocation.getZ();
+                if (dx * dx + dy * dy + dz * dz > StackerUtils.ASSUMED_ENTITY_VISIBILITY_RANGE)
+                    continue;
+
+                Player player = Bukkit.getPlayer(snapshot.getPlayerId());
+                if (player == null)
+                    continue;
+
+                ThreadUtils.runOnPrimary(player, () -> {
+                    if (player.isOnline())
+                        nmsHandler.updateEntityNameTagForPlayer(player, entityId, displayName, displayNameVisible);
+                });
+            }
+            return;
+        }
+
         for (Player player : this.getPlayersInVisibleRange())
-            nmsHandler.updateEntityNameTagForPlayer(player, this.entity, displayName, this.displayNameVisible);
+            nmsHandler.updateEntityNameTagForPlayer(player, entityId, displayName, displayNameVisible);
     }
 
     @Override
